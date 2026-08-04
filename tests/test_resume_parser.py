@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tools.resume_parser import ExtractedResume, ResumeParser
+from tools.skill_normalizer import extract_skills_from_text
 
 
 @pytest.fixture
@@ -143,6 +144,12 @@ class TestParseFile:
 
         with pytest.raises(ValueError, match="Unsupported file format"):
             parser.parse_file(str(unsupported))
+
+
+def test_raw_text_skill_recovery_handles_spaced_pdf_words():
+    """PDF extraction may split letters, but the factual skill is retained."""
+    skills = extract_skills_from_text("Built with T ensorFlow, PyT orch, and F AISS.")
+    assert {"TensorFlow", "PyTorch", "FAISS"} <= set(skills)
 
 
 class TestExtractedResumeModel:

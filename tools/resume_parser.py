@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from tools.skill_normalizer import extract_skills_from_text, normalize_skill_list
+
 if TYPE_CHECKING:
     from langchain_ollama import ChatOllama
 
@@ -77,7 +79,15 @@ class ResumeParser:
         structured_llm = self.llm.with_structured_output(ExtractedResume)
         chain = EXTRACTION_PROMPT | structured_llm
         result = chain.invoke({"resume_text": resume_text})
-        return result.model_dump()
+        extracted = result.model_dump()
+        # Keep the model's structured extraction, but supplement it with
+        # skills visibly present in the raw document. This prevents a compact
+        # local model from silently reducing two distinct resumes to the same
+        # four generic skills.
+        extracted["skills"] = normalize_skill_list(
+            extracted["skills"] + extract_skills_from_text(resume_text)
+        )
+        return extracted
 
     def parse_file(self, file_path: str) -> dict:
         """Parse a resume file and return structured data.

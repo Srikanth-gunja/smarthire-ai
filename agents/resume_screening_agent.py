@@ -97,13 +97,16 @@ class ResumeScreeningAgent:
             "jd_data": str(input_data.job_description),
         })
 
+        grounded_skills = parsed.get("skills", [])
         output = ResumeScreeningOutput(
-            candidate_name=result.candidate_name,
-            skills=result.skills,
-            experience_years=result.experience_years,
-            education=result.education,
+            candidate_name=parsed.get("candidate_name") or result.candidate_name,
+            skills=grounded_skills,
+            experience_years=parsed.get("experience_years", result.experience_years),
+            education=parsed.get("education", result.education),
             summary=result.summary,
-            match_score=result.match_score,
+            match_score=self._calculate_match_score(
+                grounded_skills, input_data.job_description
+            ),
             extracted_fields={
                 "certifications": parsed.get("certifications", []),
                 "past_roles": parsed.get("past_roles", []),

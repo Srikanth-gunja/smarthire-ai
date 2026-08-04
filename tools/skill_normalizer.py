@@ -23,6 +23,22 @@ _ALIASES = {
     "relational sql": "sql",
 }
 
+# Conservative vocabulary used only to recover skills visibly present in raw
+# resume text. It protects the workflow when a small local model returns an
+# incomplete structured skill list. No skill is added unless its normalized
+# spelling occurs in the document itself.
+_RESUME_SKILL_VOCABULARY = (
+    "Python", "SQL", "Java", "JavaScript", "TypeScript", "HTML", "CSS",
+    "React", "Node.js", "Express.js", "Flask", "Streamlit", "FastAPI",
+    "MongoDB", "MySQL", "PostgreSQL", "Oracle", "Docker", "Git", "GitHub",
+    "Postman", "Jupyter Notebook", "NumPy", "Pandas", "Matplotlib", "Seaborn",
+    "Scikit-learn", "TensorFlow", "PyTorch", "NLTK", "Hugging Face", "FAISS",
+    "LangChain", "LangGraph", "Gemini", "OpenAI", "ResNet", "LSTM", "CNN",
+    "Data Structures and Algorithms", "Linear Algebra", "Calculus", "Probability",
+    "Statistics", "Object-Oriented Programming", "Operating Systems",
+    "Computer Networks", "DBMS", "Machine Learning", "Deep Learning",
+)
+
 
 def _split_outside_parentheses(text: str) -> list[str]:
     """Split a category entry on list separators while retaining parentheses."""
@@ -90,3 +106,14 @@ def skills_match(left: str, right: str) -> bool:
         or (len(left_key) >= 4 and left_key in right_key)
         or (len(right_key) >= 4 and right_key in left_key)
     )
+
+
+def extract_skills_from_text(text: str) -> list[str]:
+    """Find explicitly written, common technical skills in raw resume text."""
+    compact_text = re.sub(r"[^a-z0-9+#.]", "", text.casefold())
+    extracted = []
+    for skill in _RESUME_SKILL_VOCABULARY:
+        compact_skill = re.sub(r"[^a-z0-9+#.]", "", skill.casefold())
+        if compact_skill in compact_text:
+            extracted.append(skill)
+    return extracted

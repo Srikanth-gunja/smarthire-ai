@@ -108,7 +108,9 @@ class TestScreenResume:
                 result = agent.screen_resume(input_data)
 
         assert result.candidate_name == "Jane Doe"
-        assert result.match_score == 75.0
+        # The persisted score uses grounded parser facts, not the screening
+        # model's potentially incomplete or fabricated score.
+        assert result.match_score == pytest.approx(66.7)
         assert isinstance(result.skills, list)
 
 
