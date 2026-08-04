@@ -1,0 +1,38 @@
+[
+  {
+    "candidate_name": "Gunja Srikanth",
+    "date": "2026-08-05",
+    "time_start": "09:00",
+    "time_end": "10:00",
+    "interviewer": "Alice Manager",
+    "interview_type": "phone",
+    "status": "confirmed"
+  },
+  {
+    "candidate_name": "Gunja Srikanth",
+    "date": "2026-08-04",
+    "time_start": "09:00",
+    "time_end": "10:00",
+    "interviewer": "Bob Tech Lead",
+    "interview_type": "technical",
+    "status": "confirmed"
+  },
+  {
+    "candidate_name": "Peduri Venkata Sairam",
+    "date": "2026-08-05",
+    "time_start": "10:00",
+    "time_end": "11:00",
+    "interviewer": "Alice Manager",
+    "interview_type": "phone",
+    "status": "confirmed"
+  },
+  {
+    "candidate_name": "Gunja Srikanth",
+    "date": "2026-08-05",
+    "time_start": "09:00",
+    "time_end": "10:00",
+    "interviewer": "Bob Tech Lead",
+    "interview_type": "technical",
+    "status": "confirmed"
+  }
+]

@@ -1,0 +1,14 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+data/*.local
+chroma_db/
+.ruff_cache/
+
+# SQLite persistence (generated at runtime)
+db/*.db
+db/*.db-wal
+db/*.db-shm
+db/*.db-journal

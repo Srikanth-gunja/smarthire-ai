@@ -1,0 +1,645 @@
+"""LangGraph orchestration — builds and compiles the SmartHire AI graph.
+
+This module defines the StateGraph, registers all agent nodes, wires
+conditional edges based on Supervisor routing, and compiles the graph
+for execution.
+
+Graph shape:
+    START → supervisor → {resume_screening, candidate_matching,
+                          interview_scheduling, hr_assistant}
+                       → memory_update (persists session data)
+                       → reflection (validates & polishes output)
+                       → END
+
+Conditional edges out of the supervisor route to one or more agent nodes
+in sequence. Each agent node pops itself off the active_agents list and
+routes to the next agent, or to memory_update when the queue is empty.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.graph import END, StateGraph
+
+from memory.state import SmartHireState
+from supervisor import Supervisor
+
+logger = logging.getLogger(__name__)
+
+
+# ── Routing helpers ───────────────────────────────────────────────────
+
+
+def _route_to_next_agent(state: SmartHireState) -> str:
+    """Read the first agent in the active_agents queue and route to it.
+
+    After each agent executes it pops itself off the list.  When the
+    queue is empty we fall through to memory_update.
+    """
+    agents = state.get("active_agents", [])
+    if agents:
+        return agents[0]
+    return "memory_update"
+
+
+def _route_after_reflection(state: SmartHireState) -> str:
+    """Decide what happens after the Reflection Node runs.
+
+    If validation failed AND this is the first reflection pass, loop back to
+    the responsible agent for a single correction attempt.  Otherwise the
+    pipeline ends — the result is returned to the user with any remaining
+    issues surfaced in ``reflection_notes`` rather than silently dropped.
+    """
+    retry_agent = state.get("retry_agent")
+    attempts = state.get("reflection_attempts", 0)
+    if retry_agent and attempts <= 1:
+        return retry_agent
+    return "END"
+
+
+# ── Graph builder ─────────────────────────────────────────────────────
+
+
+def build_graph(
+    supervisor: Supervisor,
+    resume_screening_agent: Any,
+    candidate_matching_agent: Any,
+    interview_scheduler_agent: Any,
+    hr_assistant_agent: Any,
+    session_id: str = "",
+    llm: Any = None,
+    checkpointer: Any = None,
+) -> Any:
+    """Build and compile the LangGraph StateGraph for SmartHire AI.
+
+    Agent instances are captured via closure so the node functions have
+    no module-level singletons — easy to test with mocks.
+
+    Args:
+        supervisor: The Supervisor instance for intent classification.
+        resume_screening_agent: ResumeScreeningAgent instance.
+        candidate_matching_agent: CandidateMatchingAgent instance.
+        interview_scheduler_agent: InterviewSchedulerAgent instance.
+        hr_assistant_agent: HRAssistantAgent instance.
+        session_id: Session identifier for conversation memory persistence.
+        llm: Optional LLM for the reflection polish pass.
+        checkpointer: Optional LangGraph checkpointer.  When not supplied but
+            ``session_id`` is set, the shared SQLite checkpointer
+            (``SqliteSaver`` over ``db/smarthire.db``) is used so agent state
+            survives Streamlit reruns and app restarts.
+
+    Returns:
+        A compiled StateGraph ready for invocation via ``.invoke()``.
+    """
+
+    # ── Node: Supervisor ──────────────────────────────────────────────
+
+    def supervisor_node(state: SmartHireState) -> dict:
+        from utils.models import SupervisorInput
+
+        history_msgs = state.get("conversation_history", [])
+        user_query = history_msgs[-1].content if history_msgs else ""
+
+        history = [
+            {
+                "role": "user" if isinstance(m, HumanMessage) else "assistant",
+                "content": m.content,
+            }
+            for m in history_msgs
+        ]
+
+        input_data = SupervisorInput(
+            user_query=user_query,
+            conversation_history=history,
+        )
+        plan = supervisor.classify_intent(input_data)
+
+        logger.info(
+            "Supervisor classified intent=%s agents=%s",
+            plan.intent,
+            plan.agents_to_invoke,
+        )
+
+        return {
+            "current_intent": plan.intent,
+            "active_agents": plan.agents_to_invoke,
+            "conversation_history": [
+                AIMessage(
+                    content=(
+                        f"[Supervisor] Intent: {plan.intent}. "
+                        f"Routing to: {', '.join(plan.agents_to_invoke)}. "
+                        f"Reasoning: {plan.reasoning}"
+                    )
+                ),
+            ],
+        }
+
+    # ── Node: Resume Screening ────────────────────────────────────────
+
+    def resume_screening_node(state: SmartHireState) -> dict:
+        from tools.jd_analyzer import JDAnalyzer
+        from utils.models import ResumeScreeningInput
+
+        history_msgs = state.get("conversation_history", [])
+        jd_data = dict(state.get("job_description", {}))
+        # The UI stores the original JD immediately.  Extract its requirements
+        # here, at execution time, so all downstream agents score against the
+        # actual uploaded/pasted role rather than placeholder metadata.
+        if jd_data.get("raw_text") and not jd_data.get("required_skills"):
+            extracted_jd = JDAnalyzer(resume_screening_agent.llm).analyze(
+                jd_data["raw_text"]
+            )
+            jd_data = {**jd_data, **extracted_jd}
+
+        resume_inputs = state.get("resume_inputs", [])
+        # Backward-compatible single-document flow for chat/API callers.
+        if not resume_inputs:
+            resume_text = history_msgs[-1].content if history_msgs else ""
+            resume_inputs = [{"name": None, "text": resume_text}]
+
+        screened = []
+        for resume in resume_inputs:
+            text = str(resume.get("text") or "").strip()
+            if not text:
+                continue
+            result = resume_screening_agent.screen_resume(
+                ResumeScreeningInput(resume_text=text, job_description=jd_data),
+                resume_filename=resume.get("name"),
+            )
+            screened.append(result.model_dump())
+
+        remaining = state.get("active_agents", [])[1:]
+        logger.info("ResumeScreening completed: %d resume(s)", len(screened))
+
+        return {
+            "resumes": screened,
+            "job_description": jd_data,
+            "active_agents": remaining,
+            "conversation_history": [
+                AIMessage(
+                    content=(
+                        f"[ResumeScreening] Screened {len(screened)} resume(s) "
+                        f"against {jd_data.get('job_title') or 'the uploaded role'}."
+                    )
+                ),
+            ],
+        }
+
+    # ── Node: Candidate Matching ──────────────────────────────────────
+
+    def candidate_matching_node(state: SmartHireState) -> dict:
+        from utils.models import CandidateMatchingInput
+
+        resumes = state.get("resumes", [])
+        jd_data = state.get("job_description", {})
+
+        input_data = CandidateMatchingInput(
+            resumes=resumes,
+            job_description=jd_data,
+            reflection_feedback=state.get("reflection_feedback"),
+        )
+        result = candidate_matching_agent.rank_candidates(input_data)
+
+        remaining = state.get("active_agents", [])[1:]
+        logger.info(
+            "CandidateMatching completed: %d candidates ranked",
+            result.total_candidates_evaluated,
+        )
+
+        return {
+            "candidate_rankings": [r.model_dump() for r in result.ranked_candidates],
+            "active_agents": remaining,
+            "conversation_history": [
+                AIMessage(
+                    content=(
+                        f"[CandidateMatching] Ranked {result.total_candidates_evaluated} "
+                        f"candidates. Summary: {result.summary}"
+                    )
+                ),
+            ],
+        }
+
+    # ── Node: Interview Scheduling ────────────────────────────────────
+
+    def interview_scheduling_node(state: SmartHireState) -> dict:
+        from utils.models import InterviewSchedulingInput
+
+        rankings = state.get("candidate_rankings", [])
+        candidates = (
+            [r.get("candidate_name", "") for r in rankings[:3]]
+            if rankings
+            else ["Unknown"]
+        )
+
+        availability = state.get("candidate_availability", [])
+        if not availability:
+            # A dynamic next-business-day fallback keeps conversational
+            # scheduling useful without embedding a demo-only calendar date.
+            from datetime import UTC, datetime, timedelta
+
+            next_day = datetime.now(UTC).date() + timedelta(days=1)
+            while next_day.weekday() >= 5:
+                next_day += timedelta(days=1)
+            availability = [
+                {
+                    "candidate_name": candidate,
+                    "date": next_day.isoformat(),
+                    "preferred_times": [{"time_start": "09:00", "time_end": "17:00"}],
+                }
+                for candidate in candidates
+            ]
+
+        input_data = InterviewSchedulingInput(
+            candidates=candidates,
+            availability=availability,
+            reflection_feedback=state.get("reflection_feedback"),
+        )
+        result = interview_scheduler_agent.propose_schedule(input_data)
+
+        remaining = state.get("active_agents", [])[1:]
+        logger.info("InterviewScheduling completed: %s", result.summary)
+
+        return {
+            "interview_slots": [s.model_dump() for s in result.proposed_slots],
+            "active_agents": remaining,
+            "conversation_history": [
+                AIMessage(content=f"[InterviewScheduling] {result.summary}"),
+            ],
+        }
+
+    # ── Node: HR Assistant ────────────────────────────────────────────
+
+    def hr_assistant_node(state: SmartHireState) -> dict:
+        from utils.models import HRAssistantInput
+
+        history_msgs = state.get("conversation_history", [])
+        query = ""
+        for msg in reversed(history_msgs):
+            if isinstance(msg, HumanMessage):
+                query = msg.content
+                break
+
+        input_data = HRAssistantInput(
+            query=query,
+            context={
+                "job_description": state.get("job_description", {}),
+                "candidate_rankings": state.get("candidate_rankings", []),
+                "interview_slots": state.get("interview_slots", []),
+                "prior_answers": state.get("hr_answers", []),
+            },
+            reflection_feedback=state.get("reflection_feedback"),
+        )
+        result = hr_assistant_agent.answer_query(input_data, session_id=session_id)
+
+        remaining = state.get("active_agents", [])[1:]
+        logger.info("HRAssistant completed: confidence=%.2f", result.confidence)
+
+        return {
+            "hr_answers": [result.model_dump()],
+            "active_agents": remaining,
+            "conversation_history": [
+                AIMessage(content=f"[HRAssistant] {result.answer}"),
+            ],
+        }
+
+    # ── Node: Memory Update ───────────────────────────────────────────
+
+    def memory_update_node(state: SmartHireState) -> dict:
+        """Persist conversation memory and session data after each turn.
+
+        Updates the ConversationMemory store with:
+        - All new messages from this turn
+        - Any job descriptions discussed
+        - Any shortlisted candidates from rankings
+        - Interview preferences if available
+        """
+        from memory.conversation_memory import ConversationMemory
+
+        mem = ConversationMemory()
+        sid = session_id or "default"
+
+        # Append all new messages from this turn's conversation_history
+        history = state.get("conversation_history", [])
+        existing = mem.get_history(sid)
+        existing_count = len(existing)
+        for msg in history[existing_count:]:
+            mem.append_turn(sid, msg)
+
+        # Cache job description if present
+        jd = state.get("job_description")
+        if jd:
+            mem.store_job_description(sid, jd)
+
+        # Cache shortlisted candidates from rankings
+        for candidate in state.get("candidate_rankings", []):
+            mem.add_shortlisted_candidate(sid, candidate)
+
+        # Cache interview preferences if present
+        slots = state.get("interview_slots", [])
+        if slots:
+            mem.update_interview_preferences(
+                sid,
+                {"last_scheduled_count": len(slots)},
+            )
+
+        logger.info(
+            "Memory update: session=%s history_len=%d jd=%s candidates=%d",
+            sid,
+            len(mem.get_history(sid)),
+            bool(jd),
+            len(mem.get_shortlisted_candidates(sid)),
+        )
+        return {}
+
+    # ── Node: Reflection ──────────────────────────────────────────────
+
+    def reflection_node(state: SmartHireState) -> dict:
+        """Run the 4-point validation checklist and produce final output.
+
+        Checks:
+          a) verify_candidate_recommendations_match_jd
+          b) check_interview_schedule_conflicts
+          c) check_all_questions_answered
+          d) improve_clarity_and_consistency
+
+        Issues are surfaced in reflection_notes rather than hidden.
+        """
+        from agents.reflection_node import run_reflection
+
+        return run_reflection(state, llm=llm)
+
+    # ── Assemble the graph ────────────────────────────────────────────
+
+    graph = StateGraph(SmartHireState)
+
+    # Nodes
+    graph.add_node("supervisor", supervisor_node)
+    graph.add_node("resume_screening", resume_screening_node)
+    graph.add_node("candidate_matching", candidate_matching_node)
+    graph.add_node("interview_scheduling", interview_scheduling_node)
+    graph.add_node("hr_assistant", hr_assistant_node)
+    graph.add_node("memory_update", memory_update_node)
+    graph.add_node("reflection", reflection_node)
+
+    # Entry point
+    graph.set_entry_point("supervisor")
+
+    # Conditional edges out of supervisor → first agent or memory_update
+    graph.add_conditional_edges(
+        "supervisor",
+        _route_to_next_agent,
+        {
+            "resume_screening": "resume_screening",
+            "candidate_matching": "candidate_matching",
+            "interview_scheduling": "interview_scheduling",
+            "hr_assistant": "hr_assistant",
+            "memory_update": "memory_update",
+        },
+    )
+
+    # Conditional edges out of each agent → next agent or memory_update
+    for agent_name in [
+        "resume_screening",
+        "candidate_matching",
+        "interview_scheduling",
+        "hr_assistant",
+    ]:
+        graph.add_conditional_edges(
+            agent_name,
+            _route_to_next_agent,
+            {
+                "resume_screening": "resume_screening",
+                "candidate_matching": "candidate_matching",
+                "interview_scheduling": "interview_scheduling",
+                "hr_assistant": "hr_assistant",
+                "memory_update": "memory_update",
+            },
+        )
+
+    # Linear tail: memory_update → reflection
+    graph.add_edge("memory_update", "reflection")
+
+    # Reflection → END, or loop back once to the responsible agent when
+    # validation fails so it can attempt a correction (see
+    # ``_route_after_reflection``).  The retried agent drains the empty
+    # ``active_agents`` queue back to memory_update → reflection for a
+    # second, final validation pass.
+    graph.add_conditional_edges(
+        "reflection",
+        _route_after_reflection,
+        {
+            "resume_screening": "resume_screening",
+            "candidate_matching": "candidate_matching",
+            "interview_scheduling": "interview_scheduling",
+            "hr_assistant": "hr_assistant",
+            "memory_update": "memory_update",
+            "END": END,
+        },
+    )
+
+    # Persist conversation state with LangGraph's SQLite checkpointer
+    # (SqliteSaver over db/smarthire.db), keyed by thread_id == session id.
+    compile_kwargs: dict[str, Any] = {}
+    if checkpointer is not None:
+        compile_kwargs["checkpointer"] = checkpointer
+    elif session_id:
+        from memory.conversation_memory import get_checkpointer
+
+        compile_kwargs["checkpointer"] = get_checkpointer()
+
+    return graph.compile(**compile_kwargs)
+
+
+# ── Public entrypoint ─────────────────────────────────────────────────
+
+
+def _build_components(session_id: str):
+    """Create the LLM, agents, checkpointer, and compiled graph for a session."""
+    from agents.candidate_matching_agent import CandidateMatchingAgent
+    from agents.hr_assistant_agent import HRAssistantAgent
+    from agents.interview_scheduler_agent import InterviewSchedulerAgent
+    from agents.resume_screening_agent import ResumeScreeningAgent
+    from memory.conversation_memory import get_checkpointer, get_thread_config
+    from utils.llm_factory import get_llm
+
+    llm = get_llm()
+
+    sup = Supervisor(llm)
+    resume_agent = ResumeScreeningAgent(llm)
+    matching_agent = CandidateMatchingAgent(llm)
+    scheduler_agent = InterviewSchedulerAgent(llm)
+    hr_agent = HRAssistantAgent(llm)
+
+    checkpointer = get_checkpointer()
+    compiled = build_graph(
+        sup, resume_agent, matching_agent, scheduler_agent, hr_agent,
+        session_id=session_id, llm=llm, checkpointer=checkpointer,
+    )
+    return compiled, checkpointer, get_thread_config(session_id)
+
+
+def _prepare_input_state(
+    user_input: str,
+    state: SmartHireState | None,
+    checkpointer: Any,
+    config: dict,
+) -> dict:
+    """Build the input state for a graph invocation.
+
+    When a prior checkpoint exists, only the new user message is passed as
+    input (the checkpointer restores prior history) to avoid duplicating the
+    conversation via the append reducer.  Fresh threads pass state through.
+    """
+    if state is None:
+        state = {}
+
+    prior = checkpointer.get_tuple(config)
+    if prior is not None:
+        base = dict(prior.checkpoint.get("channel_values") or {})
+        for key, value in state.items():
+            if key != "conversation_history":
+                base[key] = value
+
+        new_messages = []
+        if user_input:
+            prev_msgs = base.get("conversation_history", [])
+            already_last = (
+                prev_msgs
+                and isinstance(prev_msgs[-1], HumanMessage)
+                and prev_msgs[-1].content == user_input
+            )
+            if not already_last:
+                new_messages = [HumanMessage(content=user_input)]
+        base["conversation_history"] = new_messages
+        return base
+
+    if "conversation_history" not in state:
+        state["conversation_history"] = []
+    history = state["conversation_history"]
+    if user_input and not (
+        history
+        and isinstance(history[-1], HumanMessage)
+        and history[-1].content == user_input
+    ):
+        state["conversation_history"] = list(history) + [
+            HumanMessage(content=user_input)
+        ]
+    return state
+
+
+def _resolve_session(session_id: str | None) -> str:
+    """Create (or refresh) a session row and return its id."""
+    from memory.conversation_memory import ConversationMemory
+
+    mem = ConversationMemory()
+    if session_id is None:
+        session_id = mem.create_session()
+    else:
+        # Refresh activity so the session can be resumed after a restart.
+        mem.db.upsert_session(session_id)
+    return session_id
+
+
+def run_smarthire(
+    user_input: str,
+    state: SmartHireState | None = None,
+    session_id: str | None = None,
+) -> SmartHireState:
+    """Run the full SmartHire AI pipeline for a single user input.
+
+    Creates LLM, agents, and graph on each call (suitable for CLI / Phase 5
+    integration).  For live per-agent progress, use :func:`run_smarthire_stream`.
+
+    Args:
+        user_input: The raw user message.
+        state: Optional existing state to continue from.
+        session_id: Optional session id for memory persistence. Generated
+            if not provided.
+
+    Returns:
+        The updated SmartHireState after all agents have run.
+    """
+    session_id = _resolve_session(session_id)
+    compiled, checkpointer, config = _build_components(session_id)
+    input_state = _prepare_input_state(user_input, state, checkpointer, config)
+    return compiled.invoke(input_state, config=config)
+
+
+def run_smarthire_stream(
+    user_input: str,
+    state: SmartHireState | None = None,
+    session_id: str | None = None,
+):
+    """Stream the SmartHire pipeline, yielding ``(event_type, node_name)``.
+
+    The graph runs with ``stream_mode="debug"`` so the caller sees each node
+    *start* (``("task", <node>)``) and *finish* (``("task_result", <node>)``)
+    — ideal for live progress UIs while the local Ollama models respond
+    (typically 10-30s).
+
+    The final state is not yielded; the caller reads it back from the SQLite
+    checkpointer afterwards (see ``memory.conversation_memory``).
+
+    Yields:
+        Pairs of ``(event_type, node_name)``.
+    """
+    session_id = _resolve_session(session_id)
+    compiled, checkpointer, config = _build_components(session_id)
+    input_state = _prepare_input_state(user_input, state, checkpointer, config)
+
+    for event in compiled.stream(input_state, config=config, stream_mode="debug"):
+        event_type = event.get("type")
+        node_name = (event.get("payload") or {}).get("name")
+        if event_type in ("task", "task_result") and node_name:
+            yield event_type, node_name
+
+
+# ── CLI smoke test ────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import json as _json
+
+    from agents.candidate_matching_agent import CandidateMatchingAgent
+    from agents.hr_assistant_agent import HRAssistantAgent
+    from agents.interview_scheduler_agent import InterviewSchedulerAgent
+    from agents.resume_screening_agent import ResumeScreeningAgent
+    from utils.llm_factory import get_llm
+
+    logging.basicConfig(level=logging.INFO)
+
+    print("=== SmartHire AI Graph Smoke Test ===\n")
+
+    llm = get_llm()
+
+    sup = Supervisor(llm)
+    resume_agent = ResumeScreeningAgent(llm)
+    matching_agent = CandidateMatchingAgent(llm)
+    scheduler_agent = InterviewSchedulerAgent(llm)
+    hr_agent = HRAssistantAgent(llm)
+
+    compiled = build_graph(
+        sup, resume_agent, matching_agent, scheduler_agent, hr_agent
+    )
+
+    # Run an HR question scenario against the real LLM
+    initial_state: SmartHireState = {
+        "conversation_history": [
+            HumanMessage(
+                content="What are the stages of the hiring process?"
+            )
+        ],
+    }
+
+    print("Input: What are the stages of the hiring process?\n")
+
+    result = compiled.invoke(initial_state)
+
+    print(f"Intent:           {result.get('current_intent', 'N/A')}")
+    print(f"Active agents:    {result.get('active_agents', [])}")
+    print(f"HR answers:       {_json.dumps(result.get('hr_answers', []), indent=2)}")
+    print(f"Final response:   {result.get('final_response', 'N/A')}")
+    print(f"Reflection notes: {_json.dumps(result.get('reflection_notes', {}), indent=2)}")
+    print("\n=== Smoke Test Complete ===")

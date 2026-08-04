@@ -1,0 +1,15 @@
+# SmartHire AI — Streamlit theme + server settings.
+# Deep enterprise teal + neutral grays — deliberately not the Streamlit default.
+
+[theme]
+primaryColor = "#0E7C86"
+backgroundColor = "#F4F7F9"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1F2A37"
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
