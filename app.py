@@ -1485,13 +1485,6 @@ def _render_upload_tab() -> None:
                 for r in st.session_state.resume_texts:
                     st.markdown(f"**{r['name']}**")
                     st.caption(f"{len(r['text']):,} characters extracted")
-                    st.download_button(
-                        "Download original",
-                        data=r.get("content") or r["text"].encode("utf-8"),
-                        file_name=r["name"],
-                        mime=r.get("mime", "text/plain"),
-                        key=f"resume_download_{r['name']}",
-                    )
                     st.text_area(
                         "Extracted text",
                         value=r["text"],
@@ -1499,6 +1492,20 @@ def _render_upload_tab() -> None:
                         disabled=True,
                         key=f"resume_preview_{r['name']}",
                         label_visibility="collapsed",
+                    )
+            st.markdown("**Saved resume files**")
+            for r in st.session_state.resume_texts:
+                file_col, download_col = st.columns([3, 2])
+                with file_col:
+                    st.caption(f"📎 {r['name']}")
+                with download_col:
+                    st.download_button(
+                        "Download",
+                        data=r.get("content") or r["text"].encode("utf-8"),
+                        file_name=r["name"],
+                        mime=r.get("mime", "text/plain"),
+                        key=f"resume_download_{r['name']}",
+                        use_container_width=True,
                     )
         else:
             _empty_state(
@@ -1563,14 +1570,6 @@ def _render_upload_tab() -> None:
         if jd_text:
             with st.expander("Review extracted job description text"):
                 st.caption(f"{len(jd_text):,} characters extracted")
-                if jd_record:
-                    st.download_button(
-                        "Download job description",
-                        data=jd_record.get("content") or jd_text.encode("utf-8"),
-                        file_name=jd_record.get("name", "job-description.txt"),
-                        mime=jd_record.get("mime", "text/plain"),
-                        key="jd_download",
-                    )
                 st.text_area(
                     "Extracted job description",
                     value=jd_text,
@@ -1579,6 +1578,20 @@ def _render_upload_tab() -> None:
                     key="jd_text_preview",
                     label_visibility="collapsed",
                 )
+            if jd_record:
+                st.markdown("**Saved job description file**")
+                file_col, download_col = st.columns([3, 2])
+                with file_col:
+                    st.caption(f"📎 {jd_record.get('name', 'job-description.txt')}")
+                with download_col:
+                    st.download_button(
+                        "Download",
+                        data=jd_record.get("content") or jd_text.encode("utf-8"),
+                        file_name=jd_record.get("name", "job-description.txt"),
+                        mime=jd_record.get("mime", "text/plain"),
+                        key="jd_download",
+                        use_container_width=True,
+                    )
         else:
             _empty_state(
                 "📝",
