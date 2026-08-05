@@ -33,6 +33,11 @@ class SmartHireState(TypedDict, total=False):
     # Append reducer: each node's messages are added, not replaced.
     conversation_history: Annotated[list[BaseMessage], operator.add]
 
+    # Role of the current user: "recruiter" (default) or "candidate".
+    # Drives role-aware routing, HR assistant context, and the final
+    # response so candidate and recruiter experiences never mix.
+    user_role: str
+
     # ── Supervisor Output ────────────────────────────────────────────
     # Classified intent from the Supervisor for this turn.
     current_intent: str

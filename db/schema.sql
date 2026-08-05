@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     role TEXT NOT NULL,             -- 'user' | 'assistant' | 'agent:<agent_name>'
     content TEXT NOT NULL,
     agent_name TEXT,                -- which agent produced this, null for user turns
+    mode TEXT,                      -- 'recruiter' | 'candidate' (chat transcript owner)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -108,3 +109,4 @@ CREATE INDEX IF NOT EXISTS idx_screenings_jd ON screenings(jd_id);
 CREATE INDEX IF NOT EXISTS idx_interviews_jd ON interviews(jd_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_mode ON chat_messages(session_id, mode, created_at);

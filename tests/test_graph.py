@@ -15,7 +15,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.messages import HumanMessage
 
-from graph import build_graph
+from graph import (
+    _parse_recruiter_results_intent,
+    answer_candidate_query,
+    answer_recruiter_chat,
+    build_graph,
+)
 from memory.state import SmartHireState
 from supervisor import Supervisor
 from utils.models import (
@@ -25,6 +30,7 @@ from utils.models import (
     InterviewSchedulingOutput,
     RankedCandidate,
     ResumeScreeningOutput,
+    SupervisorInput,
 )
 
 # ── Fixtures ──────────────────────────────────────────────────────────
@@ -454,6 +460,90 @@ class TestHRAssistant:
         input_to_hr = call_args[0][0]
         assert "interview stages" in input_to_hr.query.lower()
 
+    def test_hr_receives_role_and_candidate_context_is_scoped(
+        self,
+        mock_supervisor,
+        mock_resume_agent,
+        mock_matching_agent,
+        mock_scheduler_agent,
+        mock_hr_agent,
+    ):
+        """A candidate's HR context never contains recruiter-side workflow data."""
+        mock_supervisor.classify_intent.return_value = ExecutionPlan(
+            intent="hr_question",
+            agents_to_invoke=["hr_assistant"],
+            reasoning="hr",
+        )
+
+        compiled = _build(
+            mock_supervisor,
+            mock_resume_agent,
+            mock_matching_agent,
+            mock_scheduler_agent,
+            mock_hr_agent,
+        )
+
+        state: SmartHireState = {
+            "conversation_history": [
+                HumanMessage(content="When is my interview?")
+            ],
+            "user_role": "candidate",
+            "candidate_rankings": [
+                {"candidate_name": "Sarah Chen", "match_score": 85.0}
+            ],
+            "interview_slots": [
+                {"candidate_name": "Sarah Chen", "date": "2026-08-10"}
+            ],
+        }
+
+        compiled.invoke(state)
+
+        call_args = mock_hr_agent.answer_query.call_args
+        input_to_hr = call_args[0][0]
+        assert input_to_hr.user_role == "candidate"
+        assert "candidate_rankings" not in input_to_hr.context
+        assert "interview_slots" not in input_to_hr.context
+
+    def test_hr_receives_recruiter_workflow_context(
+        self,
+        mock_supervisor,
+        mock_resume_agent,
+        mock_matching_agent,
+        mock_scheduler_agent,
+        mock_hr_agent,
+    ):
+        """A recruiter's HR context does include workflow data."""
+        mock_supervisor.classify_intent.return_value = ExecutionPlan(
+            intent="hr_question",
+            agents_to_invoke=["hr_assistant"],
+            reasoning="hr",
+        )
+
+        compiled = _build(
+            mock_supervisor,
+            mock_resume_agent,
+            mock_matching_agent,
+            mock_scheduler_agent,
+            mock_hr_agent,
+        )
+
+        state: SmartHireState = {
+            "conversation_history": [
+                HumanMessage(content="Show candidate summaries")
+            ],
+            "user_role": "recruiter",
+            "candidate_rankings": [
+                {"candidate_name": "Sarah Chen", "match_score": 85.0}
+            ],
+        }
+
+        compiled.invoke(state)
+
+        call_args = mock_hr_agent.answer_query.call_args
+        input_to_hr = call_args[0][0]
+        assert input_to_hr.user_role == "recruiter"
+        assert "candidate_rankings" in input_to_hr.context
+
 
 # ── Edge cases ────────────────────────────────────────────────────────
 
@@ -566,6 +656,195 @@ class TestEdgeCases:
         assert result.get("job_description", {}).get("job_title") == "Preserved"
         assert len(result.get("resumes", [])) == 1
         assert result["resumes"][0]["candidate_name"] == "Existing"
+
+
+# ── Supervisor role policy ────────────────────────────────────────────
+
+
+class TestSupervisorRolePolicy:
+    """Role-aware routing: candidates only reach the HR Assistant."""
+
+    def _supervisor_with_plan(self, mock_llm, plan: ExecutionPlan) -> Supervisor:
+        structured = MagicMock()
+        structured.invoke.return_value = plan
+        mock_llm.with_structured_output.return_value = structured
+        return Supervisor(mock_llm)
+
+    def test_candidate_scheduling_query_routes_to_hr_only(self, mock_llm):
+        """Even an 'interview/schedule' query from a candidate stays in HR."""
+        sup = self._supervisor_with_plan(
+            mock_llm,
+            ExecutionPlan(
+                intent="interview_scheduling",
+                agents_to_invoke=["interview_scheduling"],
+                reasoning="User wants to schedule an interview.",
+            ),
+        )
+        result = sup.classify_intent(
+            SupervisorInput(user_query="When is my interview?", user_role="candidate")
+        )
+        assert result.intent == "hr_question"
+        assert result.agents_to_invoke == ["hr_assistant"]
+
+    def test_candidate_hr_query_routes_to_hr(self, mock_llm):
+        sup = self._supervisor_with_plan(
+            mock_llm,
+            ExecutionPlan(
+                intent="hr_question",
+                agents_to_invoke=["hr_assistant"],
+                reasoning="Status question.",
+            ),
+        )
+        result = sup.classify_intent(
+            SupervisorInput(user_query="What is my application status?", user_role="candidate")
+        )
+        assert result.agents_to_invoke == ["hr_assistant"]
+
+    def test_recruiter_agents_preserved(self, mock_llm):
+        """Recruiter routing is unchanged by the role policy."""
+        sup = self._supervisor_with_plan(
+            mock_llm,
+            ExecutionPlan(
+                intent="interview_scheduling",
+                agents_to_invoke=["interview_scheduling"],
+                reasoning="Schedule for shortlisted candidate.",
+            ),
+        )
+        result = sup.classify_intent(
+            SupervisorInput(user_query="Schedule an interview", user_role="recruiter")
+        )
+        assert result.agents_to_invoke == ["interview_scheduling"]
+
+    def test_fallback_candidate_routes_to_hr(self, mock_llm):
+        """The keyword fallback is role-aware too."""
+        sup = Supervisor(mock_llm)
+        result = sup._fallback_classify("screen resumes please", role="candidate")
+        assert result.agents_to_invoke == ["hr_assistant"]
+
+    def test_fallback_recruiter_routes_to_screening(self, mock_llm):
+        """Recruiter fallback keeps recruiter routing."""
+        sup = Supervisor(mock_llm)
+        result = sup._fallback_classify("screen resumes please", role="recruiter")
+        assert result.agents_to_invoke == ["resume_screening"]
+
+
+class TestAnswerCandidateQuery:
+    """Candidate chat bypasses the pipeline and answers via the HR Assistant."""
+
+    @patch("utils.llm_factory.get_llm")
+    @patch("agents.hr_assistant_agent.HRAssistantAgent")
+    def test_answers_directly_with_candidate_role(self, mock_hr_cls, mock_get_llm):
+        mock_hr = MagicMock()
+        mock_hr.answer_query.return_value = HRAssistantOutput(
+            answer="Most roles have 3 interview rounds.",
+            sources=["interview_rounds"],
+            confidence=0.9,
+            needs_escalation=False,
+        )
+        mock_hr_cls.return_value = mock_hr
+
+        answer = answer_candidate_query(
+            "How many interview rounds are there?",
+            "sess-123",
+            {"prior_answers": ["previous answer"]},
+        )
+
+        assert answer == "Most roles have 3 interview rounds."
+        input_to_hr = mock_hr.answer_query.call_args[0][0]
+        assert input_to_hr.user_role == "candidate"
+        assert "prior_answers" in input_to_hr.context
+
+
+class TestAnswerRecruiterChat:
+    """Recruiter chat answers from stored results, never re-runs the pipeline."""
+
+    _SAMPLE_STATE = {
+        "resumes": [
+            {"candidate_name": "Sarah Chen", "match_score": 85.0,
+             "skills": ["Python", "React"]},
+        ],
+        "candidate_rankings": [
+            {"candidate_name": "Sarah Chen", "match_score": 85.0, "rank": 1,
+             "justification": "Strong match."},
+        ],
+        "interview_slots": [
+            {"candidate_name": "Sarah Chen", "date": "2026-08-10",
+             "time_start": "09:00", "time_end": "10:00",
+             "interviewer": "Bob Tech Lead", "interview_type": "technical",
+             "status": "confirmed"},
+        ],
+        "job_description": {"job_title": "Senior Developer"},
+    }
+
+    def test_intent_classification(self):
+        assert _parse_recruiter_results_intent("screen resumes") == "screening"
+        assert _parse_recruiter_results_intent("rank candidates") == "rankings"
+        assert _parse_recruiter_results_intent("compare candidates") == "rankings"
+        assert _parse_recruiter_results_intent("schedule interviews") == "scheduling"
+        assert _parse_recruiter_results_intent("hiring insights") == "insights"
+        assert _parse_recruiter_results_intent("What is the interview process?") is None
+        assert _parse_recruiter_results_intent("best practices for scheduling") is None
+
+    def test_screening_answers_from_stored_results(self):
+        answer = answer_recruiter_chat("screen resumes", "sess", dict(self._SAMPLE_STATE))
+        assert "Sarah Chen" in answer
+        assert "85%" in answer
+        assert "1 screened resume" in answer
+
+    def test_rankings_answers_from_stored_results(self):
+        answer = answer_recruiter_chat("rank candidates", "sess", dict(self._SAMPLE_STATE))
+        assert "#1 Sarah Chen" in answer
+        assert "85% match" in answer
+
+    def test_scheduling_answers_from_stored_results(self):
+        answer = answer_recruiter_chat("schedule interviews", "sess", dict(self._SAMPLE_STATE))
+        assert "Sarah Chen" in answer
+        assert "confirmed" in answer
+
+    def test_insights_answers_from_stored_results(self):
+        answer = answer_recruiter_chat("hiring insights", "sess", dict(self._SAMPLE_STATE))
+        assert "Senior Developer" in answer
+        assert "Sarah Chen" in answer
+
+    def test_no_resumes_screened_message(self):
+        answer = answer_recruiter_chat("screen resumes", "sess", {})
+        assert "No resumes have been screened yet" in answer
+
+    def test_no_rankings_message(self):
+        answer = answer_recruiter_chat("rank candidates", "sess", {})
+        assert "No candidates have been ranked yet" in answer
+
+    def test_no_slots_message(self):
+        answer = answer_recruiter_chat("schedule interviews", "sess", {})
+        assert "No interviews have been scheduled yet" in answer
+
+    def test_no_data_insights_message(self):
+        answer = answer_recruiter_chat("hiring insights", "sess", {})
+        assert "No hiring data yet" in answer
+
+    @patch("utils.llm_factory.get_llm")
+    @patch("agents.hr_assistant_agent.HRAssistantAgent")
+    def test_process_question_uses_hr_knowledge_base(self, mock_hr_cls, mock_get_llm):
+        mock_hr = MagicMock()
+        mock_hr.answer_query.return_value = HRAssistantOutput(
+            answer="Here are the recruiter guidelines.",
+            sources=["recruiter_guidelines"],
+            confidence=0.9,
+            needs_escalation=False,
+        )
+        mock_hr_cls.return_value = mock_hr
+
+        answer = answer_recruiter_chat(
+            "What are the best practices for scheduling?",
+            "sess",
+            dict(self._SAMPLE_STATE),
+        )
+
+        assert answer == "Here are the recruiter guidelines."
+        input_to_hr = mock_hr.answer_query.call_args[0][0]
+        assert input_to_hr.user_role == "recruiter"
+        # The workflow context is included for the recruiter HR answer.
+        assert "workflow" in input_to_hr.context
 
 
 # ── Reflection validation: broken candidate scenario ──────────────────

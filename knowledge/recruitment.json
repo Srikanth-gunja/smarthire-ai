@@ -1,0 +1,173 @@
+{
+  "meta": {
+    "name": "TalentBridge HR Solutions",
+    "version": "1.1",
+    "description": "Dynamic knowledge base for the SmartHire AI HR Assistant. The assistant answers ONLY from content stored here. If a question does not match any topic, the assistant must say the information is unavailable. This version contains only GENERIC recruitment knowledge — no individual candidate status, interview times, or personal records, because candidate chat is anonymous."
+  },
+  "topics": {
+    "recruitment_process": {
+      "keywords": [
+        "hiring process",
+        "recruitment process",
+        "stages of hiring",
+        "stages of the hiring",
+        "how does the process work",
+        "application process",
+        "explain the process",
+        "explain the hiring",
+        "how do i apply",
+        "hiring steps"
+      ],
+      "content": "The recruitment process has 8 stages:\n1. Application Submission - applications are made through the careers portal or via an employee referral and acknowledged within 3 business days.\n2. Resume Screening - resumes are reviewed against job requirements (skills, experience, education). This typically takes 3-5 business days.\n3. Initial Phone Screen - a 20-30 minute call with a recruiter to verify qualifications and discuss expectations.\n4. Technical Interview - a 45-60 minute assessment covering coding challenges, system design, or portfolio review.\n5. Behavioral Interview - a 30-45 minute interview with the hiring manager focused on soft skills and collaboration.\n6. Final Decision - the hiring team reviews all feedback and decides within 5 business days.\n7. Offer Stage - a verbal offer is followed by a written letter within 2 business days.\n8. Onboarding - begins immediately after offer acceptance."
+    },
+    "interview_rounds": {
+      "keywords": [
+        "how many rounds",
+        "interview rounds",
+        "number of rounds",
+        "number of interviews",
+        "stages of the interview",
+        "how many interviews",
+        "how many interview"
+      ],
+      "content": "Most roles follow a 3-round interview process:\n1. Initial Phone Screen (20-30 minutes) with a recruiter.\n2. Technical Interview (45-60 minutes) covering coding challenges, system design, or a portfolio review.\n3. Behavioral Interview (30-45 minutes) with the hiring manager.\nFor some roles the technical and behavioral interviews may be combined into a single session."
+    },
+    "interview_duration": {
+      "keywords": [
+        "how long is the interview",
+        "interview duration",
+        "how long will the interview take",
+        "how long does the interview",
+        "interview length"
+      ],
+      "content": "Interview durations vary by round: the phone screen lasts 20-30 minutes, the technical interview lasts 45-60 minutes, and the behavioral interview lasts 30-45 minutes."
+    },
+    "interview_mode": {
+      "keywords": [
+        "online or onsite",
+        "onsite",
+        "in person",
+        "online interview",
+        "virtual interview",
+        "video interview",
+        "remote interview",
+        "mode of interview",
+        "how is the interview conducted"
+      ],
+      "content": "Interviews may be conducted online or onsite. Phone and video interviews are held online; technical and behavioral interviews may be online or onsite depending on the role and location. Candidates are always informed of the exact mode, meeting link, or address through their interview invitation."
+    },
+    "skills_evaluated": {
+      "keywords": [
+        "what skills are evaluated",
+        "skills are tested",
+        "what is tested",
+        "what will be tested",
+        "what do you evaluate",
+        "what is evaluated",
+        "skills evaluated"
+      ],
+      "content": "Each round evaluates different skills. The phone screen checks communication and basic qualification fit. The technical interview evaluates the skills listed in the job description, such as coding, system design, or domain knowledge. The behavioral interview evaluates soft skills like teamwork, leadership, conflict resolution, and problem-solving."
+    },
+    "after_interview": {
+      "keywords": [
+        "after the interview",
+        "what happens next",
+        "what happens after",
+        "next steps",
+        "what happens after the interview",
+        "what is next"
+      ],
+      "content": "After the final interview, the hiring team reviews all feedback and makes a decision, typically within 5 business days. Successful candidates receive a verbal offer followed by a written offer letter within 2 business days; other candidates receive a courtesy notification."
+    },
+    "hiring_timeline": {
+      "keywords": [
+        "how long does the process take",
+        "hiring timeline",
+        "how long is the process",
+        "total duration",
+        "how long until offer",
+        "timeline"
+      ],
+      "content": "The full process from application to offer typically takes 4-6 weeks. Application acknowledgements are sent within 3 business days, resume screening takes 3-5 business days, and the final decision is made within 5 business days of the last interview."
+    },
+    "required_documents": {
+      "keywords": [
+        "documents required",
+        "what documents",
+        "documents needed",
+        "what do i need to bring",
+        "required documents",
+        "documents do i need",
+        "what should i bring"
+      ],
+      "content": "Please have the following ready: an updated resume/CV in PDF format, a portfolio or GitHub link for technical roles, valid government-issued photo identification, copies of relevant degrees or certificates, and reference details if requested."
+    },
+    "interview_preparation": {
+      "keywords": [
+        "prepare",
+        "preparation",
+        "what should i prepare",
+        "how should i prepare",
+        "what to expect",
+        "how to prepare",
+        "tips for the interview"
+      ],
+      "content": "For the technical interview, review the skills in the job description and be ready to discuss your past projects, coding exercises, or system design. For the behavioral interview, use the STAR method (Situation, Task, Action, Result) and prepare examples of teamwork, leadership, conflict resolution, and problem-solving. Research the company, review the job posting, and prepare a few questions about the team and role."
+    },
+    "rescheduling_policy": {
+      "keywords": [
+        "reschedule",
+        "rescheduling",
+        "change my interview",
+        "postpone",
+        "cancel and rebook",
+        "move my interview"
+      ],
+      "content": "Rescheduling requests must be made at least 24 hours before the scheduled interview. Candidates should reply to their interview invitation with at least two alternative time slots. Repeated rescheduling may delay the process, so candidates are encouraged to confirm availability before booking."
+    },
+    "company_policies": {
+      "keywords": [
+        "reapply",
+        "rejected",
+        "reapply if rejected",
+        "visa sponsorship",
+        "salary range",
+        "benefits",
+        "policy",
+        "data privacy",
+        "gdpr"
+      ],
+      "content": "Candidates may reapply 6 months after a rejection. Visa sponsorship is evaluated case by case and discussed during the phone screen. Salary ranges are shared during the phone screen and are competitive based on experience, skills, and market benchmarks; benefits include health insurance, 401(k) matching, and professional development budgets. All candidate data is stored securely and accessed only by authorized recruitment personnel, and candidates may request deletion of their data under GDPR/CCPA."
+    },
+    "escalation_contacts": {
+      "keywords": [
+        "who should i contact",
+        "who do i contact",
+        "contact hr",
+        "hr team",
+        "who do i ask",
+        "reach someone",
+        "talk to a person",
+        "contact the recruitment team"
+      ],
+      "content": "For questions about the recruitment process, contact the recruitment team. For a formal complaint or escalation, ask to speak with the HR Director. For legal or compliance concerns, contact the Legal Department."
+    },
+    "recruiter_guidelines": {
+      "keywords": [
+        "screen resumes",
+        "resume screening",
+        "rank candidates",
+        "matching",
+        "compare candidates",
+        "shortlist",
+        "schedule interviews",
+        "hiring insights",
+        "analytics",
+        "candidate summary",
+        "workflow",
+        "best practices"
+      ],
+      "content": "Recruiter guidelines:\n- Schedule phone screens within 1 week of shortlisting and technical interviews within 1-2 weeks of the phone screen.\n- Always confirm availability with both the candidate and interviewer before booking.\n- Send calendar invitations with meeting links and preparation instructions at least 24 hours in advance.\n- Acknowledge applications within 3 business days and provide status updates at least every 5 business days.\n- Send rejection notifications within 3 business days of a decision.\n- Escalate to HR management for formal complaints, accommodation requests, conflicts of interest, legal questions, or compensation above the approved band by more than 15%."
+    }
+  }
+}

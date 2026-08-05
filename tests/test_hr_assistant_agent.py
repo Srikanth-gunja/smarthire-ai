@@ -1,12 +1,18 @@
-"""Tests for HRAssistantAgent — tests plumbing with mocked LLM."""
+"""Tests for HRAssistantAgent — role-aware behaviour with a JSON knowledge base."""
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agents.hr_assistant_agent import HRAnswer, HRAssistantAgent
+from agents.hr_assistant_agent import (
+    GREETING_PATTERNS,
+    UNAVAILABLE_ANSWER,
+    HRAssistantAgent,
+    HRAnswer,
+)
 from tools.candidate_database import CandidateDatabase
 from utils.models import HRAssistantInput, HRAssistantOutput
 
@@ -19,26 +25,30 @@ def mock_llm():
 
 @pytest.fixture
 def kb_path(tmp_path):
-    """Create a temporary HR knowledge base file."""
-    kb_content = """# HR Knowledge Base
-
-## Recruitment Process
-
-1. Application Submission
-2. Resume Screening
-3. Phone Screen
-4. Technical Interview
-5. Behavioral Interview
-6. Final Decision
-7. Offer Stage
-8. Onboarding
-
-## Timeline
-
-Total process takes 4-6 weeks.
-"""
-    kb_file = tmp_path / "hr_kb.md"
-    kb_file.write_text(kb_content, encoding="utf-8")
+    """Create a temporary JSON HR knowledge base file."""
+    kb = {
+        "topics": {
+            "recruitment_process": {
+                "keywords": ["hiring process", "hiring stages", "stages of hiring", "recruitment process"],
+                "content": (
+                    "The recruitment process has 8 stages: Application Submission, "
+                    "Resume Screening, Phone Screen, Technical Interview, Behavioral "
+                    "Interview, Final Decision, Offer Stage, Onboarding. The total "
+                    "timeline is 4-6 weeks."
+                ),
+            },
+            "interview_rounds": {
+                "keywords": ["how many rounds", "interview rounds", "number of interviews"],
+                "content": "Most roles have 3 rounds: phone screen, technical, behavioral.",
+            },
+            "recruiter_guidelines": {
+                "keywords": ["screen resumes", "rank candidates", "schedule interviews", "scheduling", "best practices"],
+                "content": "Schedule phone screens within 1 week of shortlisting.",
+            },
+        }
+    }
+    kb_file = tmp_path / "hr_kb.json"
+    kb_file.write_text(json.dumps(kb), encoding="utf-8")
     return str(kb_file)
 
 
@@ -76,31 +86,67 @@ class TestHRAssistantAgentInit:
 class TestAnswerQuery:
     """Tests for answer_query method."""
 
-    def test_answer_query_returns_output(self, agent, mock_llm):
-        """answer_query returns an HRAssistantOutput."""
+    def _mock_structured(self, mock_llm, answer="The process has 8 stages."):
+        from langchain_core.runnables import RunnableLambda
+
         mock_result = HRAnswer(
-            answer="The process has 8 stages.",
+            answer=answer,
             confidence=0.9,
             needs_escalation=False,
-            relevant_sections=["Recruitment Process"],
+            relevant_sections=["recruitment_process"],
         )
-        mock_structured = MagicMock()
-        mock_structured.invoke.return_value = mock_result
-        mock_structured.return_value = mock_result
-        mock_llm.with_structured_output.return_value = mock_structured
+        # A RunnableLambda stands in for the structured-output LLM so the real
+        # ChatPromptTemplate chain executes end to end in the test.
+        mock_llm.with_structured_output.return_value = RunnableLambda(
+            lambda _: mock_result
+        )
+        return mock_result
 
-        with patch("agents.hr_assistant_agent.ChatPromptTemplate") as mock_prompt_cls:
-            mock_prompt = MagicMock()
-            mock_chain = MagicMock()
-            mock_chain.invoke.return_value = mock_result
-            mock_prompt.__or__ = MagicMock(return_value=mock_chain)
-            mock_prompt_cls.from_messages.return_value = mock_prompt
+    def test_answer_query_returns_output(self, agent, mock_llm):
+        """answer_query returns an HRAssistantOutput."""
+        self._mock_structured(mock_llm)
 
-            result = agent.answer_query(HRAssistantInput(query="What are the hiring stages?"))
+        result = agent.answer_query(
+            HRAssistantInput(query="What are the hiring stages?", user_role="candidate")
+        )
 
         assert isinstance(result, HRAssistantOutput)
         assert result.answer == "The process has 8 stages."
         assert result.needs_escalation is False
+
+    def test_answer_query_recruiter_role(self, agent, mock_llm):
+        """Recruiter role questions are answered too."""
+        self._mock_structured(mock_llm, answer="Here are the recruiter guidelines.")
+
+        result = agent.answer_query(
+            HRAssistantInput(
+                query="What are the best practices for scheduling?", user_role="recruiter"
+            )
+        )
+
+        assert result.answer == "Here are the recruiter guidelines."
+
+    def test_unavailable_when_no_kb_match(self, agent):
+        """Questions with no KB match return a polite unavailable answer."""
+        result = agent.answer_query(
+            HRAssistantInput(query="xyz123 unknown topic", user_role="candidate")
+        )
+        assert result.answer == UNAVAILABLE_ANSWER
+        assert result.confidence == 0.0
+
+    def test_candidate_never_gets_recruiter_topic(self, agent):
+        """A candidate asking recruiter-style questions gets an unavailable answer."""
+        result = agent.answer_query(
+            HRAssistantInput(query="Screen resumes", user_role="candidate")
+        )
+        assert result.answer == UNAVAILABLE_ANSWER
+
+    def test_greeting_returns_friendly_message(self, agent):
+        """Greetings get a friendly canned response, not an LLM call."""
+        result = agent.answer_query(
+            HRAssistantInput(query="hello", user_role="candidate")
+        )
+        assert "HR Assistant" in result.answer
 
     def test_escalation_for_legal_query(self, agent):
         """Legal questions trigger escalation."""
@@ -136,23 +182,31 @@ class TestLoadKnowledgeBase:
 
     def test_missing_kb(self, mock_llm, tmp_path):
         """Handles missing knowledge base file."""
-        agent = HRAssistantAgent(mock_llm, knowledge_base_path=str(tmp_path / "nonexistent.md"))
+        agent = HRAssistantAgent(mock_llm, knowledge_base_path=str(tmp_path / "nonexistent.json"))
         kb = agent._load_knowledge_base()
         assert "No knowledge base available" in kb
 
 
-class TestRetrievePolicyContext:
-    """Tests for _retrieve_policy_context method."""
+class TestRetrieveRelevantSections:
+    """Tests for _retrieve_relevant_sections method."""
 
     def test_relevant_sections(self, agent):
         """Returns sections relevant to the query."""
-        sections = agent._retrieve_policy_context("What is the recruitment process?")
+        sections = agent._retrieve_relevant_sections(
+            "What is the recruitment process?", "candidate"
+        )
         assert len(sections) > 0
+        assert sections[0]["topic"] == "recruitment_process"
 
     def test_irrelevant_query(self, agent):
-        """Returns few/no sections for irrelevant queries."""
-        sections = agent._retrieve_policy_context("xyz123")
+        """Returns no sections for irrelevant queries."""
+        sections = agent._retrieve_relevant_sections("xyz123", "candidate")
         assert len(sections) == 0
+
+    def test_recruiter_topic_excluded_for_candidates(self, agent):
+        """Recruiter-only topics never match for candidates."""
+        sections = agent._retrieve_relevant_sections("screen resumes", "candidate")
+        assert all(s["topic"] != "recruiter_guidelines" for s in sections)
 
 
 class TestShouldEscalate:
@@ -169,6 +223,18 @@ class TestShouldEscalate:
     def test_accommodation_escalation(self, agent):
         """Accommodation requests need escalation."""
         assert agent._should_escalate("I need a religious accommodation") is True
+
+
+class TestGreetingPattern:
+    """Tests for greeting detection."""
+
+    def test_matches_greetings(self):
+        assert GREETING_PATTERNS.match("hi")
+        assert GREETING_PATTERNS.match("Hello!")
+        assert GREETING_PATTERNS.match("good morning")
+
+    def test_not_a_greeting(self):
+        assert not GREETING_PATTERNS.match("How many interview rounds are there?")
 
 
 class TestLookupCandidate:
@@ -208,3 +274,16 @@ class TestHRAnswerModel:
         """HRAnswer has correct defaults."""
         model = HRAnswer(answer="Test", confidence=0.5, needs_escalation=False)
         assert model.relevant_sections == []
+
+
+@patch("agents.hr_assistant_agent.HRAssistantAgent._load_kb_data", return_value={})
+class TestNoKnowledgeBase:
+    """Behaviour when the knowledge base is missing."""
+
+    def test_unavailable_answer(self, _mock, mock_llm):
+        """Empty KB always yields the unavailable answer."""
+        agent = HRAssistantAgent(mock_llm)
+        result = agent.answer_query(
+            HRAssistantInput(query="What is the hiring process?", user_role="candidate")
+        )
+        assert result.answer == UNAVAILABLE_ANSWER

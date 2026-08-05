@@ -188,23 +188,25 @@ def _restore_state(session_id: str) -> SmartHireState:
 def _load_past_session(session_id: str) -> None:
     """Switch the app to a previously saved session (chat + ranking results).
 
-    Restores the human-readable transcript from ``chat_messages`` and the
-    agent outputs (rankings, slots, final response) from the LangGraph
-    checkpointer, then reruns so the chosen session is rendered.
+    Restores the human-readable transcripts (per recruiter/candidate mode)
+    from ``chat_messages`` and the agent outputs (rankings, slots, final
+    response) from the LangGraph checkpointer, then reruns so the chosen
+    session is rendered.
     """
     audit = ChatAudit()
     st.session_state.session_id = session_id
     audit.save_session_id(session_id)
-    st.session_state.chat_messages = audit.load_messages(session_id)
+    row = Database().fetch_one(
+        "SELECT mode FROM sessions WHERE id = ?", (session_id,)
+    )
+    mode = "candidate" if row and row["mode"] == "candidate" else "recruiter"
+    st.session_state.chats = _load_all_chats(session_id, audit)
     st.session_state.graph_state = _restore_state(session_id)
     st.session_state.resume_texts = []
     st.session_state.jd_data = None
     st.session_state.show_results = True
-    row = Database().fetch_one(
-        "SELECT mode FROM sessions WHERE id = ?", (session_id,)
-    )
     st.session_state.mode_picker = (
-        "Candidate" if row and row["mode"] == "candidate" else "Recruiter"
+        "Candidate" if mode == "candidate" else "Recruiter"
     )
     # Restore paused state if the session was interrupted mid-pipeline
     paused = Database().get_session_paused(session_id)
@@ -216,6 +218,25 @@ def _load_past_session(session_id: str) -> None:
         st.session_state.pop("paused_error", None)
 
 
+def _load_all_chats(session_id: str, audit: ChatAudit) -> dict[str, list[dict]]:
+    """Load the candidate and recruiter transcripts for a session.
+
+    Candidate and recruiter chats are independent transcripts persisted under
+    the same session id (keyed by ``mode``), so switching modes never mixes
+    the two conversations.
+    """
+    return {
+        "candidate": audit.load_messages(session_id, mode="candidate"),
+        "recruiter": audit.load_messages(session_id, mode="recruiter"),
+    }
+
+
+def _active_chat() -> list[dict]:
+    """Return the chat transcript list for the current mode."""
+    role = _current_role()
+    return st.session_state.setdefault("chats", {}).setdefault(role, [])
+
+
 def _reset_current_session() -> None:
     """Clear only the active session's workspace, keeping its identifier."""
     session_id = st.session_state.session_id
@@ -224,7 +245,7 @@ def _reset_current_session() -> None:
     ConversationMemory().reset_session(session_id, mode)
     audit.clear(session_id)
     Database().clear_session_paused(session_id)
-    st.session_state.chat_messages = []
+    st.session_state.chats = {"candidate": [], "recruiter": []}
     st.session_state.graph_state = SmartHireState(conversation_history=[])
     st.session_state.resume_texts = []
     st.session_state.jd_data = None
@@ -243,7 +264,7 @@ def _start_new_session() -> None:
     session_id = ConversationMemory().create_session(mode)
     st.session_state.session_id = session_id
     audit.save_session_id(session_id)
-    st.session_state.chat_messages = []
+    st.session_state.chats = {"candidate": [], "recruiter": []}
     st.session_state.graph_state = SmartHireState(conversation_history=[])
     st.session_state.resume_texts = []
     st.session_state.jd_data = None
@@ -267,9 +288,9 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = sid
 if "graph_state" not in st.session_state:
     st.session_state.graph_state = _restore_state(st.session_state.session_id)
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = ChatAudit().load_messages(
-        st.session_state.session_id
+if "chats" not in st.session_state:
+    st.session_state.chats = _load_all_chats(
+        st.session_state.session_id, ChatAudit()
     )
 if "resume_texts" not in st.session_state:
     st.session_state.resume_texts = []
@@ -762,6 +783,57 @@ def _display_interview_slots(slots: list[dict]) -> None:
 # ── Chat rendering (agent-aware) ──────────────────────────────────────
 
 
+# Suggested questions shown above the chat input, per role.
+# Candidate chat is anonymous, so only GENERIC process questions are offered —
+# never personal questions like "What is my application status?" which this
+# chat cannot truthfully answer.
+_CANDIDATE_SUGGESTIONS = [
+    "Explain the hiring process.",
+    "How many interview rounds are there?",
+    "How long is the interview?",
+    "Is my interview online or onsite?",
+    "What happens after the interview?",
+    "How should I prepare?",
+    "What documents are required?",
+    "What skills are evaluated?",
+    "How long does the hiring process take?",
+    "Can I reschedule my interview?",
+    "Who should I contact?",
+]
+
+_RECRUITER_SUGGESTIONS = [
+    "Rank candidates",
+    "Screen resumes",
+    "Compare candidates",
+    "Schedule interviews",
+    "Hiring insights",
+    "Candidate summary",
+]
+
+
+def _current_role() -> str:
+    """Return 'candidate' or 'recruiter' from the active mode picker."""
+    return (
+        "candidate" if st.session_state.mode_picker == "Candidate" else "recruiter"
+    )
+
+
+def _render_suggestions(role: str) -> None:
+    """Render clickable suggested questions matching the user's role."""
+    questions = _CANDIDATE_SUGGESTIONS if role == "candidate" else _RECRUITER_SUGGESTIONS
+    st.caption("Try asking:")
+    cols = st.columns(3)
+    for i, question in enumerate(questions):
+        with cols[i % 3]:
+            if st.button(
+                question,
+                key=f"suggestion_{role}_{i}",
+                use_container_width=True,
+            ):
+                st.session_state.suggestion_input = question
+                st.rerun()
+
+
 def _render_chat(messages: list[dict]) -> None:
     """Render the transcript, badge-labelling each agent turn."""
     routing: list[str] = []
@@ -794,11 +866,20 @@ def _render_chat(messages: list[dict]) -> None:
 
 def _chat_section(input_placeholder: str) -> None:
     """Shared Chat UI used by both the Chat tab and Candidate Chat mode."""
-    _render_chat(st.session_state.chat_messages)
+    role = _current_role()
+    chat_messages = _active_chat()
+    _render_chat(chat_messages)
 
-    if prompt := st.chat_input(input_placeholder):
+    _render_suggestions(role)
+
+    suggestion = st.session_state.pop("suggestion_input", None)
+    prompt = st.chat_input(input_placeholder)
+    if not prompt:
+        prompt = suggestion
+
+    if prompt:
         audit = ChatAudit()
-        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        chat_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
@@ -809,24 +890,73 @@ def _chat_section(input_placeholder: str) -> None:
             else:
                 answer = "Ollama is not reachable. Start `ollama serve` to continue."
             audit.log_turn(
-                st.session_state.session_id, user_content=prompt, answer=answer
-            )
-        else:
-            prior_count = len(
-                st.session_state.graph_state.get("conversation_history", [])
-            )
-            st.session_state.pending_input = prompt
-            _run_with_progress("Running SmartHire agents…")
-            result = st.session_state.graph_state
-            answer = result.get("final_response", "No response generated.")
-            audit.log_turn(
                 st.session_state.session_id,
                 user_content=prompt,
-                result=result,
-                prior_history_count=prior_count,
+                answer=answer,
+                mode=role,
             )
+        else:
+            if role == "candidate":
+                # Candidate chat is generic KB Q&A — answer directly from the
+                # HR Assistant. Never run the recruiter pipeline here.
+                from graph import answer_candidate_query
 
-        st.session_state.chat_messages.append(
+                prior_answers = [
+                    m["content"]
+                    for m in chat_messages
+                    if m["role"] == "assistant"
+                ][-5:]
+                try:
+                    answer = answer_candidate_query(
+                        prompt,
+                        st.session_state.session_id,
+                        {"prior_answers": prior_answers},
+                    )
+                except Exception:
+                    logger.exception("Candidate chat failed")
+                    answer = (
+                        "Sorry, I couldn't process that request right now. "
+                        "Please try again in a moment."
+                    )
+                audit.log_turn(
+                    st.session_state.session_id,
+                    user_content=prompt,
+                    answer=answer,
+                    mode=role,
+                )
+            else:
+                # Recruiter chat answers directly from stored session results
+                # (screening/ranking/scheduling/insights) or the HR knowledge
+                # base. It never re-runs the multi-agent pipeline — results
+                # come from the 'Screen & Rank Candidates' workflow.
+                from graph import answer_recruiter_chat
+
+                prior_answers = [
+                    m["content"]
+                    for m in chat_messages
+                    if m["role"] == "assistant"
+                ][-5:]
+                try:
+                    answer = answer_recruiter_chat(
+                        prompt,
+                        st.session_state.session_id,
+                        dict(st.session_state.graph_state),
+                        {"prior_answers": prior_answers},
+                    )
+                except Exception:
+                    logger.exception("Recruiter chat failed")
+                    answer = (
+                        "Sorry, I couldn't process that request right now. "
+                        "Please try again in a moment."
+                    )
+                audit.log_turn(
+                    st.session_state.session_id,
+                    user_content=prompt,
+                    answer=answer,
+                    mode=role,
+                )
+
+        chat_messages.append(
             {"role": "assistant", "content": answer}
         )
         with st.chat_message("assistant"):
@@ -1354,6 +1484,7 @@ def _render_upload_tab() -> None:
             )
             st.session_state.graph_state = {
                 **st.session_state.graph_state,
+                "user_role": "recruiter",
                 "job_description": {
                     "id": jd_id,
                     "title": jd_text.strip().splitlines()[0][:200]
@@ -1547,8 +1678,9 @@ if is_recruiter:
     elif recruiter_tab == "Chat":
         st.markdown("### 💬 Chat with SmartHire AI")
         st.caption(
-            "Messages are labelled with the agent that produced them, so you can "
-            "see the multi-agent routing in action."
+            "Ask about your screened resumes, candidate rankings, interview "
+            "slots, or hiring insights — or ask HR process questions. Answers "
+            "come directly from your session results and the knowledge base."
         )
         _chat_section("Ask SmartHire AI anything…")
     else:
@@ -1559,7 +1691,9 @@ if is_recruiter:
 else:
     st.header("💬 Candidate Chat")
     st.caption(
-        "Ask questions about the recruitment process, interview prep, or "
-        "application status."
+        "Ask general questions about the recruitment process, interview "
+        "preparation, and what to expect. Answers come from our knowledge "
+        "base. This is an anonymous chat, so individual application details "
+        "are not shown here."
     )
     _chat_section("Ask an HR question…")
