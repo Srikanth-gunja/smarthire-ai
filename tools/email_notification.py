@@ -10,10 +10,12 @@ from __future__ import annotations
 import logging
 
 from utils.models import InterviewSlot
+from utils.observability import instrument_tool_methods
 
 logger = logging.getLogger(__name__)
 
 
+@instrument_tool_methods
 class EmailNotification:
     """Log-based stub for sending interview invitations and status updates."""
 

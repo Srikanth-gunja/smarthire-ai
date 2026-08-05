@@ -39,6 +39,26 @@ from utils.models import InterviewSlot
 
 logger = logging.getLogger(__name__)
 
+
+def _configure_console_logging() -> None:
+    """Ensure execution logs are visible in the Streamlit terminal."""
+    execution_logger = logging.getLogger("smarthire.execution")
+    execution_logger.setLevel(logging.INFO)
+    execution_logger.propagate = False
+    if not any(getattr(handler, "_smarthire_console", False) for handler in execution_logger.handlers):
+        handler = logging.StreamHandler()
+        handler._smarthire_console = True  # type: ignore[attr-defined]
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
+        execution_logger.addHandler(handler)
+
+
+_configure_console_logging()
+
 # Initialise the SQLite persistence layer (idempotent CREATE TABLE IF NOT EXISTS).
 Database().init_db()
 
@@ -73,6 +93,11 @@ _STAGE_ORDER = [
     "memory_update",
     "reflection",
 ]
+
+_WORKFLOW_STAGES = {
+    "screening": ["supervisor", "resume_screening", "memory_update", "reflection"],
+    "matching": ["supervisor", "candidate_matching", "memory_update", "reflection"],
+}
 
 _PRIMARY = "#0E7C86"
 _MUTED = "#6B7280"
@@ -115,11 +140,13 @@ def _score_meter(score: float) -> str:
     )
 
 
-def _stage_checklist(completed: list[str], running: str | None) -> str:
+def _stage_checklist(
+    completed: list[str], running: str | None, workflow: str | None = None
+) -> str:
     """HTML progress checklist showing pending / running / done agents."""
     done = set(completed)
     lines: list[str] = []
-    for node in _STAGE_ORDER:
+    for node in _WORKFLOW_STAGES.get(workflow or "", _STAGE_ORDER):
         meta = AGENTS.get(node, {})
         icon, label = meta.get("icon", "⚙️"), meta.get("label", node)
         if node in done:
@@ -251,7 +278,7 @@ def _reset_current_session() -> None:
     st.session_state.jd_data = None
     st.session_state.show_results = False
     st.session_state.sched = None
-    st.session_state.recruiter_tab = "Upload & Screen"
+    st.session_state.recruiter_tab = "Resume Screening"
     st.session_state.pop("paused_at_node", None)
     st.session_state.pop("paused_error", None)
     audit.save_session_id(session_id)
@@ -270,7 +297,7 @@ def _start_new_session() -> None:
     st.session_state.jd_data = None
     st.session_state.show_results = False
     st.session_state.sched = None
-    st.session_state.recruiter_tab = "Upload & Screen"
+    st.session_state.recruiter_tab = "Resume Screening"
     st.session_state.pop("paused_at_node", None)
     st.session_state.pop("paused_error", None)
 
@@ -306,7 +333,7 @@ if "mode_picker" not in st.session_state:
         "Candidate" if row and row["mode"] == "candidate" else "Recruiter"
     )
 if "recruiter_tab" not in st.session_state:
-    st.session_state.recruiter_tab = "Upload & Screen"
+    st.session_state.recruiter_tab = "Resume Screening"
 if "llm_provider" not in st.session_state:
     st.session_state.llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 if "gemini_api_key" not in st.session_state:
@@ -417,6 +444,7 @@ def _run_resume_with_progress() -> None:
     from graph import TransientError
 
     try:
+        workflow = st.session_state.graph_state.get("requested_workflow")
         with st.status("Resuming pipeline…", expanded=True) as status:
             status.update(label="Resuming from last checkpoint…", state="running")
             progress_ph = st.empty()
@@ -430,10 +458,10 @@ def _run_resume_with_progress() -> None:
                     completed.append(node)
                     running = None
                 progress_ph.markdown(
-                    _stage_checklist(completed, running), unsafe_allow_html=True
+                    _stage_checklist(completed, running, workflow), unsafe_allow_html=True
                 )
             status.update(label="✓ Pipeline complete", state="complete", expanded=False)
-            progress_ph.markdown(_stage_checklist(completed, None), unsafe_allow_html=True)
+            progress_ph.markdown(_stage_checklist(completed, None, workflow), unsafe_allow_html=True)
     except TransientError as exc:
         st.session_state.graph_state = _restore_state(st.session_state.session_id)
         _show_paused_state(exc.node_name, exc.message)
@@ -567,6 +595,7 @@ def _run_with_progress(progress_title: str) -> None:
 
     completed: list[str] = []
     running: str | None = None
+    workflow = st.session_state.graph_state.get("requested_workflow")
 
     try:
         with st.status(progress_title, expanded=True) as status:
@@ -598,14 +627,11 @@ def _run_with_progress(progress_title: str) -> None:
                     state="running",
                 )
                 progress_ph.markdown(
-                    _stage_checklist(completed, running), unsafe_allow_html=True
+                    _stage_checklist(completed, running, workflow), unsafe_allow_html=True
                 )
 
-                # Render the completed stage's results immediately
-                _render_stage(node_name, state)
-
             status.update(label="✓ Pipeline complete", state="complete", expanded=False)
-            progress_ph.markdown(_stage_checklist(completed, None), unsafe_allow_html=True)
+            progress_ph.markdown(_stage_checklist(completed, None, workflow), unsafe_allow_html=True)
 
     except TransientError as exc:
         st.session_state.graph_state = _restore_state(st.session_state.session_id)
@@ -868,20 +894,17 @@ def _chat_section(input_placeholder: str) -> None:
     """Shared Chat UI used by both the Chat tab and Candidate Chat mode."""
     role = _current_role()
     chat_messages = _active_chat()
-    _render_chat(chat_messages)
 
-    _render_suggestions(role)
-
-    suggestion = st.session_state.pop("suggestion_input", None)
-    prompt = st.chat_input(input_placeholder)
+    # Queue the input, process it, then rerun.  This keeps the response in
+    # the transcript before the FAQ buttons instead of rendering an answer
+    # beneath suggestions (the inconsistent layout shown in the screenshots).
+    prompt = st.session_state.pop("pending_chat_prompt", None)
     if not prompt:
-        prompt = suggestion
+        prompt = st.session_state.pop("suggestion_input", None)
 
     if prompt:
         audit = ChatAudit()
         chat_messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
 
         if not _llm_ok:
             _prov = (st.session_state.get("llm_provider") or "ollama").strip().lower()
@@ -959,8 +982,15 @@ def _chat_section(input_placeholder: str) -> None:
         chat_messages.append(
             {"role": "assistant", "content": answer}
         )
-        with st.chat_message("assistant"):
-            st.markdown(answer)
+        st.rerun()
+
+    _render_chat(chat_messages)
+    _render_suggestions(role)
+
+    typed_prompt = st.chat_input(input_placeholder)
+    if typed_prompt:
+        st.session_state.pending_chat_prompt = typed_prompt
+        st.rerun()
 
 
 # ── Interview scheduling helpers ──────────────────────────────────────
@@ -1342,10 +1372,10 @@ def _render_insight_tab() -> None:
 
 
 def _render_upload_tab() -> None:
-    st.markdown("### 📤 Resumes & Job Description")
+    st.markdown("### 📄 Resume Screening")
     st.caption(
-        "Upload resumes and a JD, then run the multi-agent pipeline. You'll see "
-        "each agent execute live and a ranked results table afterwards."
+        "Upload resumes and a job description, then extract a grounded screening "
+        "profile for each candidate. Ranking happens separately in Candidate Matching."
     )
 
     col_resume, col_jd = st.columns(2)
@@ -1460,7 +1490,7 @@ def _render_upload_tab() -> None:
         st.caption("Upload at least one resume and a job description to enable screening.")
 
     if st.button(
-        "🚀 Screen & Rank Candidates",
+        "🚀 Run Resume Screening",
         type="primary",
         disabled=run_disabled,
         use_container_width=True,
@@ -1485,6 +1515,7 @@ def _render_upload_tab() -> None:
             st.session_state.graph_state = {
                 **st.session_state.graph_state,
                 "user_role": "recruiter",
+                "requested_workflow": "screening",
                 "job_description": {
                     "id": jd_id,
                     "title": jd_text.strip().splitlines()[0][:200]
@@ -1493,49 +1524,30 @@ def _render_upload_tab() -> None:
                     "raw_text": jd_text,
                 },
                 "resume_inputs": list(st.session_state.resume_texts),
+                # A new screening run creates a new source snapshot.  Existing
+                # rankings must not appear to belong to it.
+                "candidate_rankings": [],
+                "reflection_notes": {},
+                "final_response": "",
+                "reflection_attempts": 0,
+                "retry_agent": None,
+                "reflection_feedback": None,
             }
-
-            resume_blocks = "\n\n".join(
-                f"=== RESUME: {r['name']} ===\n{r['text']}"
-                for r in st.session_state.resume_texts
-            )
-            combined = (
-                f"JOB DESCRIPTION:\n{jd_text}\n\n"
-                f"RESUMES:\n{resume_blocks}\n\n"
-                "Please screen these resumes against the JD and rank them."
-            )
-            st.session_state.pending_input = combined
-            st.session_state.last_user_input = combined
-            _run_with_progress("Running multi-agent pipeline…")
+            request = "Run resume screening for the uploaded resumes."
+            st.session_state.pending_input = request
+            st.session_state.last_user_input = request
+            _run_with_progress("Running resume screening…")
             st.session_state.show_results = True
 
     if st.session_state.get("show_results"):
         st.divider()
         state = st.session_state.graph_state
 
-        # Render each completed stage's results incrementally
+        # Screening results stay in this workflow. Ranking has its own tab.
         resumes = state.get("resumes", [])
         if resumes:
             _render_resume_screening_section(resumes)
-            st.divider()
-
-        rankings = state.get("candidate_rankings", [])
-        if rankings:
-            _render_matching_section(rankings)
-            st.divider()
-
-        slots = state.get("interview_slots", [])
-        if slots:
-            _render_scheduling_section(slots)
-            st.divider()
-
-        notes = state.get("reflection_notes", {})
-        if notes:
-            _render_reflection_section(notes)
-
-        final = state.get("final_response", "")
-        if final:
-            st.info(f"**Summary:** {final}")
+            st.info("Screening is complete. Open **Candidate Matching** to compare and rank this batch.")
 
         errors = state.get("error", "")
         if errors:
@@ -1543,8 +1555,69 @@ def _render_upload_tab() -> None:
 
         # Show paused state if the session was interrupted mid-pipeline
         paused_node = st.session_state.get("paused_at_node")
-        if paused_node:
+        if paused_node and state.get("requested_workflow") == "screening":
             _show_paused_state(paused_node, st.session_state.get("paused_error", ""))
+
+
+def _render_matching_tab() -> None:
+    """Render the independent candidate-comparison workflow."""
+    st.markdown("### 🎯 Candidate Matching")
+    st.caption(
+        "Compare the completed screening batch against its job description. "
+        "This does not re-read or re-parse the resumes."
+    )
+
+    state = st.session_state.graph_state
+    resumes = state.get("resumes", [])
+    jd_data = state.get("job_description", {})
+    if not resumes or not jd_data.get("raw_text"):
+        _empty_state(
+            "🎯",
+            "Screening required",
+            "Complete Resume Screening with a job description before ranking candidates.",
+        )
+        return
+
+    st.success(f"Ready to compare {len(resumes)} screened candidate(s).")
+    st.caption(f"Job description: {jd_data.get('title') or 'Uploaded job description'}")
+
+    if st.button("🚀 Rank Screened Candidates", type="primary", use_container_width=True):
+        if not _llm_ok:
+            provider = (st.session_state.get("llm_provider") or "ollama").strip().lower()
+            st.error(
+                "Add a Gemini API key in the sidebar to continue."
+                if provider == "gemini"
+                else "Cannot run: Ollama is not reachable. Start `ollama serve`."
+            )
+        else:
+            st.session_state.graph_state = {
+                **state,
+                "user_role": "recruiter",
+                "requested_workflow": "matching",
+                "candidate_rankings": [],
+                "reflection_notes": {},
+                "final_response": "",
+                "reflection_attempts": 0,
+                "retry_agent": None,
+                "reflection_feedback": None,
+            }
+            request = "Rank the completed screening batch against the job description."
+            st.session_state.pending_input = request
+            st.session_state.last_user_input = request
+            _run_with_progress("Running candidate matching…")
+            st.session_state.show_results = True
+
+    rankings = st.session_state.graph_state.get("candidate_rankings", [])
+    if rankings:
+        st.divider()
+        _render_matching_section(rankings)
+        notes = st.session_state.graph_state.get("reflection_notes", {})
+        if notes:
+            _render_reflection_section(notes)
+
+    paused_node = st.session_state.get("paused_at_node")
+    if paused_node and st.session_state.graph_state.get("requested_workflow") == "matching":
+        _show_paused_state(paused_node, st.session_state.get("paused_error", ""))
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────
@@ -1662,17 +1735,19 @@ if is_recruiter:
     st.header("📋 Recruiter Dashboard")
     if flash := st.session_state.pop("flash", None):
         st.success(flash)
-    st.caption("Pipeline: upload → screen & rank → schedule → chat → insight.")
+    st.caption("Workflow: screen resumes → match candidates → schedule → chat → insight.")
 
     recruiter_tab = st.segmented_control(
         "Recruiter sections",
-        options=["Upload & Screen", "Interview Scheduling", "Chat", "System Insight"],
+        options=["Resume Screening", "Candidate Matching", "Interview Scheduling", "Chat", "System Insight"],
         key="recruiter_tab",
         label_visibility="collapsed",
     )
 
-    if recruiter_tab == "Upload & Screen":
+    if recruiter_tab == "Resume Screening":
         _render_upload_tab()
+    elif recruiter_tab == "Candidate Matching":
+        _render_matching_tab()
     elif recruiter_tab == "Interview Scheduling":
         _render_scheduling_tab()
     elif recruiter_tab == "Chat":

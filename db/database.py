@@ -25,6 +25,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from utils.observability import instrument_tool_methods
+
 logger = logging.getLogger(__name__)
 
 DB_DIR = Path(__file__).resolve().parent
@@ -52,6 +54,7 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
+@instrument_tool_methods
 class Database:
     """Small ``sqlite3`` connection manager plus persistence helpers.
 

@@ -19,6 +19,7 @@ routes to the next agent, or to memory_update when the queue is empty.
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -28,6 +29,7 @@ from memory.state import SmartHireState
 from supervisor import Supervisor
 
 logger = logging.getLogger(__name__)
+execution_logger = logging.getLogger("smarthire.execution")
 
 
 # ── Transient error handling ──────────────────────────────────────────
@@ -90,14 +92,37 @@ def _wrap_node(node_fn: Any, node_name: str, session_id: str = "") -> Any:
     """
 
     def wrapper(state: SmartHireState) -> dict:
+        started = perf_counter()
+        execution_logger.info("event=start kind=agent agent=%s", node_name)
         try:
-            return node_fn(state)
+            result = node_fn(state)
+            execution_logger.info(
+                "event=complete kind=agent agent=%s duration_ms=%.1f",
+                node_name,
+                (perf_counter() - started) * 1000,
+            )
+            return result
         except TransientError:
+            execution_logger.exception(
+                "event=failed kind=agent agent=%s duration_ms=%.1f",
+                node_name,
+                (perf_counter() - started) * 1000,
+            )
             raise
         except Exception as exc:
             if _is_transient_error(exc):
                 _record_pause(session_id, node_name, exc)
+                execution_logger.exception(
+                    "event=failed kind=agent agent=%s duration_ms=%.1f",
+                    node_name,
+                    (perf_counter() - started) * 1000,
+                )
                 raise TransientError(node_name, str(exc)) from exc
+            execution_logger.exception(
+                "event=failed kind=agent agent=%s duration_ms=%.1f",
+                node_name,
+                (perf_counter() - started) * 1000,
+            )
             raise
 
     return wrapper
@@ -188,6 +213,25 @@ def build_graph(
         history_msgs = state.get("conversation_history", [])
         user_query = history_msgs[-1].content if history_msgs else ""
         user_role = state.get("user_role", "recruiter")
+
+        # Button-driven recruiter workflows are unambiguous.  Route them
+        # directly instead of spending a Gemini call on intent classification.
+        requested_workflow = state.get("requested_workflow")
+        direct_routes = {
+            "screening": ["resume_screening"],
+            "matching": ["candidate_matching"],
+        }
+        if requested_workflow in direct_routes:
+            agents = direct_routes[requested_workflow]
+            label = "Resume Screening" if requested_workflow == "screening" else "Candidate Matching"
+            logger.info("Direct workflow route=%s agents=%s", requested_workflow, agents)
+            return {
+                "current_intent": requested_workflow,
+                "active_agents": agents,
+                "conversation_history": [
+                    AIMessage(content=f"[Workflow] Started {label}.")
+                ],
+            }
 
         history = [
             {
@@ -469,6 +513,20 @@ def build_graph(
 
         Issues are surfaced in reflection_notes rather than hidden.
         """
+        # Screening is an extraction-and-evidence workflow, not a comparison.
+        # Save the Gemini polish/validation pass for Matching, where it checks
+        # cross-candidate claims and ranking consistency.
+        if state.get("requested_workflow") == "screening":
+            count = len(state.get("resumes", []))
+            return {
+                "reflection_notes": {},
+                "reflection_validated": True,
+                "reflection_attempts": 0,
+                "retry_agent": None,
+                "reflection_feedback": None,
+                "final_response": f"Screening complete for {count} resume(s).",
+            }
+
         from agents.reflection_node import run_reflection
 
         return run_reflection(state, llm=llm)

@@ -45,6 +45,11 @@ class SmartHireState(TypedDict, total=False):
     # Which agents were invoked this turn (e.g. ["resume_screening", "candidate_matching"]).
     active_agents: list[str]
 
+    # Optional UI-directed workflow.  Recruiter buttons use this to invoke
+    # exactly one workflow without asking the LLM supervisor to infer intent.
+    # This keeps Screening and Matching independent and reduces remote LLM calls.
+    requested_workflow: str
+
     # ── Resume Screening Agent Output ────────────────────────────────
     # List of parsed resume dicts, each containing structured fields
     # like skills, experience, education, summary.
