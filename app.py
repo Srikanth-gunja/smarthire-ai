@@ -181,12 +181,22 @@ def _empty_state(icon: str, title: str, body: str) -> None:
         )
 
 
-def _metric_card(label: str, value: str, help_text: str) -> None:
+def _metric_card(
+    label: str, value: str, help_text: str, active: bool = False
+) -> None:
+    active_badge = (
+        "<span style='display:inline-block;width:8px;height:8px;border-radius:50%;"
+        "background:#22C55E;margin-right:6px;"
+        "box-shadow:0 0 0 3px rgba(34,197,94,.25)'></span>"
+        if active
+        else ""
+    )
+    border_color = "#16A34A" if active else _BORDER
     st.markdown(
-        f"<div style='background:#fff;border:1px solid {_BORDER};border-radius:12px;"
+        f"<div style='background:#fff;border:1px solid {border_color};border-radius:12px;"
         f"padding:1rem .8rem'>"
         f"<div style='color:{_MUTED};font-size:.78em;text-transform:uppercase;letter-spacing:.04em'>"
-        f"{label}</div>"
+        f"{active_badge}{label}</div>"
         f"<div style='font-size:1.7em;font-weight:700;color:{_PRIMARY}'>{value}</div>"
         f"<div style='color:#9CA3AF;font-size:.75em'>{help_text}</div></div>",
         unsafe_allow_html=True,
@@ -1355,23 +1365,10 @@ def _render_scheduling_tab() -> None:
 # ── System Insight ────────────────────────────────────────────────────
 
 
-def _pipeline_rankings() -> list[dict]:
-    """Ranked candidates sorted by rank for the pipeline overview."""
-    rankings = st.session_state.graph_state.get("candidate_rankings", [])
-
-    def _rank_key(c):
-        try:
-            return int(c.get("rank", 999))
-        except (TypeError, ValueError):
-            return 999
-
-    return sorted(rankings, key=_rank_key)
-
-
 def _render_insight_tab() -> None:
     st.markdown("### 📊 Session Insight")
     st.caption(
-        f"Showing only data from the active session "
+        f"Showing only data from the loaded session "
         f"({st.session_state.session_id[:8]})."
     )
     state = st.session_state.graph_state
@@ -1391,7 +1388,12 @@ def _render_insight_tab() -> None:
             "Uploaded or processed here",
         )
     with cols[1]:
-        _metric_card("Current session", "Active", "Separate from past sessions")
+        _metric_card(
+            "Active session",
+            st.session_state.session_id[:8],
+            "Currently loaded session",
+            active=True,
+        )
     with cols[2]:
         _metric_card("Avg match score", avg_score, "This session's ranking")
     with cols[3]:
@@ -1732,20 +1734,34 @@ with st.sidebar:
         sessions = Database().get_sessions()
         if not sessions:
             st.caption("No past sessions yet.")
+        # Fixed order by original creation time (started_at), so loading a
+        # session never re-sorts it to the top.
+        sessions = sorted(
+            sessions,
+            key=lambda s: str(s["started_at"] or ""),
+            reverse=True,
+        )
         for s in sessions:
             sid = s["id"]
             mode_name = s["mode"].capitalize() if s["mode"] else "Unknown"
-            timestamp = str(s["last_active_at"])[:16]
+            timestamp = str(s["started_at"])[:16]
             label = f"{mode_name} · {timestamp} · {sid[:8]}"
             if sid == st.session_state.session_id:
-                label += " (active)"
-            st.button(
-                label,
-                key=f"past_session_{sid}",
-                use_container_width=True,
-                on_click=_load_past_session,
-                args=(sid,),
-            )
+                st.markdown(
+                    f"<div style='background:#ECFDF5;border:1px solid #22C55E;"
+                    f"border-radius:8px;padding:8px 10px;margin-bottom:6px'>"
+                    f"<span style='color:#16A34A;font-weight:700'>● {label} — "
+                    f"active</span></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.button(
+                    label,
+                    key=f"past_session_{sid}",
+                    use_container_width=True,
+                    on_click=_load_past_session,
+                    args=(sid,),
+                )
 
     st.divider()
 
