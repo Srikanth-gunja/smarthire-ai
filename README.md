@@ -290,7 +290,7 @@ smarthire-ai/
 
 ### Candidate Workflow
 
-Candidates can ask HR questions about the recruitment process — application status, interview prep, policies, timelines. The HR Assistant grounds answers in the approved knowledge base and escalates to human HR for sensitive topics (legal, accommodation, discrimination).
+Candidate chat is an anonymous, general Q&A. Candidates can ask about the recruitment process — interview rounds, duration, mode, preparation, required documents, what happens after an interview, hiring timeline, rescheduling policy, and who to contact. The HR Assistant answers directly from the dynamic knowledge base (`knowledge/recruitment.json`) without running the recruiter pipeline, never invents individual statuses or interview details, and escalates to human HR for sensitive topics (legal, accommodation, discrimination).
 
 ---
 

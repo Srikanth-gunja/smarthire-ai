@@ -55,18 +55,25 @@ CREATE TABLE IF NOT EXISTS interviews (
     id TEXT PRIMARY KEY,
     candidate_id TEXT REFERENCES candidates(id),
     jd_id TEXT REFERENCES job_descriptions(id),
+    session_id TEXT,
     proposed_start TIMESTAMP,
     proposed_end TIMESTAMP,
+    interview_type TEXT DEFAULT 'technical',
+    interviewer TEXT,
     status TEXT DEFAULT 'proposed',  -- proposed | confirmed | cancelled
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_interviews_session ON interviews(session_id);
 
 -- Sessions (maps a Streamlit session to a LangGraph thread_id)
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,             -- = LangGraph thread_id
     mode TEXT,                       -- 'recruiter' | 'candidate'
     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_active_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    last_active_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    paused_at_node TEXT,             -- node name where a transient error occurred
+    error_message TEXT               -- human-readable error description
 );
 
 -- HR Assistant answers (HRAssistantAgent output)
@@ -91,6 +98,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     role TEXT NOT NULL,             -- 'user' | 'assistant' | 'agent:<agent_name>'
     content TEXT NOT NULL,
     agent_name TEXT,                -- which agent produced this, null for user turns
+    mode TEXT,                      -- 'recruiter' | 'candidate' (chat transcript owner)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -101,3 +109,19 @@ CREATE INDEX IF NOT EXISTS idx_screenings_jd ON screenings(jd_id);
 CREATE INDEX IF NOT EXISTS idx_interviews_jd ON interviews(jd_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_mode ON chat_messages(session_id, mode, created_at);
+
+-- Original recruiter uploads, retained per session so the Screening tab can
+-- restore and download exactly the documents used in that workflow.
+CREATE TABLE IF NOT EXISTS session_uploads (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    kind TEXT NOT NULL,             -- 'resume' | 'job_description'
+    filename TEXT NOT NULL,
+    mime_type TEXT,
+    content BLOB NOT NULL,
+    extracted_text TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_uploads_session ON session_uploads(session_id, kind, created_at);

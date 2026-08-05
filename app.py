@@ -13,10 +13,11 @@ and a data-driven System Insight tab.
 from __future__ import annotations
 
 import datetime
+import io
 import logging
 import os
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import matplotlib
@@ -38,6 +39,26 @@ from tools.calendar_tool import CalendarTool
 from utils.models import InterviewSlot
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_console_logging() -> None:
+    """Ensure execution logs are visible in the Streamlit terminal."""
+    execution_logger = logging.getLogger("smarthire.execution")
+    execution_logger.setLevel(logging.INFO)
+    execution_logger.propagate = False
+    if not any(getattr(handler, "_smarthire_console", False) for handler in execution_logger.handlers):
+        handler = logging.StreamHandler()
+        handler._smarthire_console = True  # type: ignore[attr-defined]
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
+        execution_logger.addHandler(handler)
+
+
+_configure_console_logging()
 
 # Initialise the SQLite persistence layer (idempotent CREATE TABLE IF NOT EXISTS).
 Database().init_db()
@@ -73,6 +94,11 @@ _STAGE_ORDER = [
     "memory_update",
     "reflection",
 ]
+
+_WORKFLOW_STAGES = {
+    "screening": ["supervisor", "resume_screening", "memory_update", "reflection"],
+    "matching": ["supervisor", "candidate_matching", "memory_update", "reflection"],
+}
 
 _PRIMARY = "#0E7C86"
 _MUTED = "#6B7280"
@@ -115,11 +141,13 @@ def _score_meter(score: float) -> str:
     )
 
 
-def _stage_checklist(completed: list[str], running: str | None) -> str:
+def _stage_checklist(
+    completed: list[str], running: str | None, workflow: str | None = None
+) -> str:
     """HTML progress checklist showing pending / running / done agents."""
     done = set(completed)
     lines: list[str] = []
-    for node in _STAGE_ORDER:
+    for node in _WORKFLOW_STAGES.get(workflow or "", _STAGE_ORDER):
         meta = AGENTS.get(node, {})
         icon, label = meta.get("icon", "⚙️"), meta.get("label", node)
         if node in done:
@@ -153,12 +181,22 @@ def _empty_state(icon: str, title: str, body: str) -> None:
         )
 
 
-def _metric_card(label: str, value: str, help_text: str) -> None:
+def _metric_card(
+    label: str, value: str, help_text: str, active: bool = False
+) -> None:
+    active_badge = (
+        "<span style='display:inline-block;width:8px;height:8px;border-radius:50%;"
+        "background:#22C55E;margin-right:6px;"
+        "box-shadow:0 0 0 3px rgba(34,197,94,.25)'></span>"
+        if active
+        else ""
+    )
+    border_color = "#16A34A" if active else _BORDER
     st.markdown(
-        f"<div style='background:#fff;border:1px solid {_BORDER};border-radius:12px;"
+        f"<div style='background:#fff;border:1px solid {border_color};border-radius:12px;"
         f"padding:1rem .8rem'>"
         f"<div style='color:{_MUTED};font-size:.78em;text-transform:uppercase;letter-spacing:.04em'>"
-        f"{label}</div>"
+        f"{active_badge}{label}</div>"
         f"<div style='font-size:1.7em;font-weight:700;color:{_PRIMARY}'>{value}</div>"
         f"<div style='color:#9CA3AF;font-size:.75em'>{help_text}</div></div>",
         unsafe_allow_html=True,
@@ -188,24 +226,103 @@ def _restore_state(session_id: str) -> SmartHireState:
 def _load_past_session(session_id: str) -> None:
     """Switch the app to a previously saved session (chat + ranking results).
 
-    Restores the human-readable transcript from ``chat_messages`` and the
-    agent outputs (rankings, slots, final response) from the LangGraph
-    checkpointer, then reruns so the chosen session is rendered.
+    Restores the human-readable transcripts (per recruiter/candidate mode)
+    from ``chat_messages`` and the agent outputs (rankings, slots, final
+    response) from the LangGraph checkpointer, then reruns so the chosen
+    session is rendered.
     """
     audit = ChatAudit()
     st.session_state.session_id = session_id
     audit.save_session_id(session_id)
-    st.session_state.chat_messages = audit.load_messages(session_id)
-    st.session_state.graph_state = _restore_state(session_id)
-    st.session_state.resume_texts = []
-    st.session_state.jd_data = None
-    st.session_state.show_results = True
     row = Database().fetch_one(
         "SELECT mode FROM sessions WHERE id = ?", (session_id,)
     )
+    mode = "candidate" if row and row["mode"] == "candidate" else "recruiter"
+    st.session_state.chats = _load_all_chats(session_id, audit)
+    st.session_state.graph_state = _restore_state(session_id)
+    _clear_upload_widget_state()
+    _restore_session_uploads(session_id)
+    st.session_state.show_results = True
     st.session_state.mode_picker = (
-        "Candidate" if row and row["mode"] == "candidate" else "Recruiter"
+        "Candidate" if mode == "candidate" else "Recruiter"
     )
+    # Restore paused state if the session was interrupted mid-pipeline
+    paused = Database().get_session_paused(session_id)
+    if paused:
+        st.session_state.paused_at_node = paused["paused_at_node"]
+        st.session_state.paused_error = paused["error_message"]
+    else:
+        st.session_state.pop("paused_at_node", None)
+        st.session_state.pop("paused_error", None)
+
+
+def _restore_session_uploads(session_id: str) -> None:
+    """Restore retained source documents so Screening stays usable per session."""
+    resumes: list[dict] = []
+    job_description: dict | None = None
+    for row in Database().get_session_uploads(session_id):
+        record = {
+            "name": row["filename"],
+            "text": row["extracted_text"],
+            "content": bytes(row["content"]),
+            "mime": row["mime_type"] or "application/octet-stream",
+        }
+        if row["kind"] == "resume":
+            resumes.append(record)
+        elif row["kind"] == "job_description":
+            job_description = record
+
+    # Older sessions predate upload retention. Their checkpoint still holds
+    # extracted text, so keep that useful fallback and make it downloadable.
+    if not resumes:
+        resumes = [
+            {
+                "name": item.get("name") or "resume.txt",
+                "text": item.get("text", ""),
+                "content": str(item.get("text", "")).encode("utf-8"),
+                "mime": "text/plain",
+            }
+            for item in st.session_state.graph_state.get("resume_inputs", [])
+            if item.get("text")
+        ]
+    if job_description is None:
+        raw_text = st.session_state.graph_state.get("job_description", {}).get("raw_text", "")
+        if raw_text:
+            job_description = {
+                "name": "job-description.txt",
+                "text": raw_text,
+                "content": raw_text.encode("utf-8"),
+                "mime": "text/plain",
+            }
+    st.session_state.resume_texts = resumes
+    st.session_state.jd_data = job_description
+    st.session_state.pop("jd_paste_text", None)
+
+
+def _clear_upload_widget_state() -> None:
+    """Remove browser widget values before switching the underlying session."""
+    for key in list(st.session_state):
+        if key in {"resume_uploader", "jd_uploader", "jd_source", "jd_paste_text", "jd_text_preview"} or key.startswith("resume_preview_"):
+            st.session_state.pop(key, None)
+
+
+def _load_all_chats(session_id: str, audit: ChatAudit) -> dict[str, list[dict]]:
+    """Load the candidate and recruiter transcripts for a session.
+
+    Candidate and recruiter chats are independent transcripts persisted under
+    the same session id (keyed by ``mode``), so switching modes never mixes
+    the two conversations.
+    """
+    return {
+        "candidate": audit.load_messages(session_id, mode="candidate"),
+        "recruiter": audit.load_messages(session_id, mode="recruiter"),
+    }
+
+
+def _active_chat() -> list[dict]:
+    """Return the chat transcript list for the current mode."""
+    role = _current_role()
+    return st.session_state.setdefault("chats", {}).setdefault(role, [])
 
 
 def _reset_current_session() -> None:
@@ -215,14 +332,27 @@ def _reset_current_session() -> None:
     mode = "candidate" if st.session_state.mode_picker == "Candidate" else "recruiter"
     ConversationMemory().reset_session(session_id, mode)
     audit.clear(session_id)
-    st.session_state.chat_messages = []
+    Database().delete_session_uploads(session_id)
+    Database().clear_session_paused(session_id)
+    _clear_upload_widget_state()
+    st.session_state.chats = {"candidate": [], "recruiter": []}
     st.session_state.graph_state = SmartHireState(conversation_history=[])
     st.session_state.resume_texts = []
     st.session_state.jd_data = None
     st.session_state.show_results = False
     st.session_state.sched = None
-    st.session_state.recruiter_tab = "Upload & Screen"
+    st.session_state.recruiter_tab = "Resume Screening"
+    st.session_state.pop("paused_at_node", None)
+    st.session_state.pop("paused_error", None)
     audit.save_session_id(session_id)
+
+
+def _clear_all_sessions() -> None:
+    """Remove every saved session, upload, workflow result, and chat record."""
+    ChatAudit().clear_session_id()
+    ConversationMemory().clear_all_sessions()
+    _start_new_session()
+    st.session_state.flash = "All saved sessions and their uploaded files were cleared."
 
 
 def _start_new_session() -> None:
@@ -232,13 +362,16 @@ def _start_new_session() -> None:
     session_id = ConversationMemory().create_session(mode)
     st.session_state.session_id = session_id
     audit.save_session_id(session_id)
-    st.session_state.chat_messages = []
+    _clear_upload_widget_state()
+    st.session_state.chats = {"candidate": [], "recruiter": []}
     st.session_state.graph_state = SmartHireState(conversation_history=[])
     st.session_state.resume_texts = []
     st.session_state.jd_data = None
     st.session_state.show_results = False
     st.session_state.sched = None
-    st.session_state.recruiter_tab = "Upload & Screen"
+    st.session_state.recruiter_tab = "Resume Screening"
+    st.session_state.pop("paused_at_node", None)
+    st.session_state.pop("paused_error", None)
 
 
 # ── Session init ──────────────────────────────────────────────────────
@@ -254,12 +387,12 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = sid
 if "graph_state" not in st.session_state:
     st.session_state.graph_state = _restore_state(st.session_state.session_id)
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = ChatAudit().load_messages(
-        st.session_state.session_id
+if "chats" not in st.session_state:
+    st.session_state.chats = _load_all_chats(
+        st.session_state.session_id, ChatAudit()
     )
 if "resume_texts" not in st.session_state:
-    st.session_state.resume_texts = []
+    _restore_session_uploads(st.session_state.session_id)
 if "jd_data" not in st.session_state:
     st.session_state.jd_data = None
 if "show_results" not in st.session_state:
@@ -272,7 +405,11 @@ if "mode_picker" not in st.session_state:
         "Candidate" if row and row["mode"] == "candidate" else "Recruiter"
     )
 if "recruiter_tab" not in st.session_state:
-    st.session_state.recruiter_tab = "Upload & Screen"
+    st.session_state.recruiter_tab = "Resume Screening"
+if "llm_provider" not in st.session_state:
+    st.session_state.llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+if "gemini_api_key" not in st.session_state:
+    st.session_state.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
 
 
 # ── Environment helpers ───────────────────────────────────────────────
@@ -280,8 +417,9 @@ if "recruiter_tab" not in st.session_state:
 
 def _check_llm() -> bool:
     """Validate the selected model provider without exposing credentials."""
-    if os.getenv("LLM_PROVIDER", "ollama").strip().lower() == "gemini":
-        return bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+    provider = st.session_state.get("llm_provider") or "ollama"
+    if provider == "gemini":
+        return bool(st.session_state.get("gemini_api_key", "").strip())
     import urllib.error
     import urllib.request
 
@@ -312,6 +450,25 @@ def _extract_docx_text(uploaded_file) -> str:
     return "\n".join(paragraph.text for paragraph in document.paragraphs)
 
 
+def _read_uploaded_document(uploaded_file) -> dict:
+    """Keep the original bytes and extract text once for workflow/session use."""
+    content = uploaded_file.getvalue()
+    filename = uploaded_file.name
+    stream = io.BytesIO(content)
+    if filename.lower().endswith(".pdf"):
+        text = _extract_pdf_text(stream)
+    elif filename.lower().endswith(".docx"):
+        text = _extract_docx_text(stream)
+    else:
+        text = content.decode("utf-8")
+    return {
+        "name": filename,
+        "text": text,
+        "content": content,
+        "mime": uploaded_file.type or "application/octet-stream",
+    }
+
+
 def _iter_pipeline(user_input: str):
     """Stream the graph, yielding (event_type, node_name) pairs."""
     from graph import run_smarthire_stream
@@ -324,31 +481,295 @@ def _iter_pipeline(user_input: str):
     )
 
 
-def _run_with_progress(progress_title: str) -> None:
-    """Run the current graph task, streaming a live stage checklist.
+def _iter_resume_pipeline():
+    """Stream the graph resuming from the last checkpoint, yielding (event_type, node_name)."""
+    from graph import resume_run
 
-    Reads the final state from the checkpointer after streaming and stores it
-    back into ``st.session_state.graph_state``.
-    """
-    with st.status(progress_title, expanded=True) as status:
-        status.update(label="Starting agents…", state="running")
-        progress_ph = st.empty()
-        completed: list[str] = []
-        running: str | None = None
-        for event_type, node in _iter_pipeline(st.session_state.pending_input):
-            if event_type == "task":
-                running = node
-                status.update(label=f"Running: {_agent_label(node)}", state="running")
-            else:
-                completed.append(node)
-                running = None
-            progress_ph.markdown(
-                _stage_checklist(completed, running), unsafe_allow_html=True
-            )
-        status.update(label="✓ Pipeline complete", state="complete", expanded=False)
-        progress_ph.markdown(_stage_checklist(completed, None), unsafe_allow_html=True)
+    return resume_run(st.session_state.session_id)
 
+
+def _show_paused_state(node_name: str, error_msg: str) -> None:
+    """Display the paused state with Resume and Retry buttons."""
+    state = st.session_state.graph_state
+    # Build the list of completed agents from conversation history
+    history = state.get("conversation_history", [])
+    completed_names = []
+    for msg in history:
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and content.startswith("["):
+            # Extract agent name from "[AgentName] ..." messages
+            bracket_end = content.index("]") if "]" in content else -1
+            if bracket_end > 1:
+                agent_tag = content[1:bracket_end].strip().lower().replace(" ", "_")
+                if agent_tag in AGENTS:
+                    completed_names.append(agent_tag)
+
+    completed_str = (
+        ", ".join(_agent_label(a) for a in completed_names)
+        if completed_names
+        else "None"
+    )
+
+    st.warning(
+        f"⚠️ Provider is experiencing high demand.\n\n"
+        f"**Completed:** {completed_str}\n\n"
+        f"**Paused at:** {_agent_label(node_name)}\n\n"
+        f"**Error:** {error_msg}",
+    )
+
+    col_resume, col_retry = st.columns(2)
+    with col_resume:
+        if st.button("🔄 Resume", type="primary", use_container_width=True, key="resume_btn"):
+            _run_resume_with_progress()
+            st.rerun()
+    with col_retry:
+        if st.button("🔁 Retry from start", type="secondary", use_container_width=True, key="retry_btn"):
+            st.session_state.graph_state = _restore_state(st.session_state.session_id)
+            st.session_state.pending_input = st.session_state.get("last_user_input", "")
+            _run_with_progress("Running multi-agent pipeline…")
+            st.rerun()
+
+
+def _run_resume_with_progress() -> None:
+    """Resume a paused pipeline from the last checkpoint, with progress UI."""
+    from graph import TransientError
+
+    try:
+        workflow = st.session_state.graph_state.get("requested_workflow")
+        with st.status("Resuming pipeline…", expanded=True) as status:
+            status.update(label="Resuming from last checkpoint…", state="running")
+            progress_ph = st.empty()
+            completed: list[str] = []
+            running: str | None = None
+            for event_type, node in _iter_resume_pipeline():
+                if event_type == "task":
+                    running = node
+                    status.update(label=f"Running: {_agent_label(node)}", state="running")
+                else:
+                    completed.append(node)
+                    running = None
+                progress_ph.markdown(
+                    _stage_checklist(completed, running, workflow), unsafe_allow_html=True
+                )
+            status.update(label="✓ Pipeline complete", state="complete", expanded=False)
+            progress_ph.markdown(_stage_checklist(completed, None, workflow), unsafe_allow_html=True)
+    except TransientError as exc:
+        st.session_state.graph_state = _restore_state(st.session_state.session_id)
+        _show_paused_state(exc.node_name, exc.message)
+        return
+    except (ValueError, RuntimeError, KeyError) as exc:
+        st.error(f"Resume failed: {exc}")
+        return
+
+    # Resume completed successfully — clear paused state
+    Database().clear_session_paused(st.session_state.session_id)
+    st.session_state.pop("paused_at_node", None)
+    st.session_state.pop("paused_error", None)
     st.session_state.graph_state = _restore_state(st.session_state.session_id)
+
+
+# ── Incremental pipeline rendering ────────────────────────────────────
+
+
+def _iter_pipeline_updates(user_input: str):
+    """Stream the graph yielding (node_name, state_update) per node.
+
+    Uses ``stream_mode="updates"`` so each completed node's output is
+    available immediately for incremental rendering.
+    """
+    from graph import run_smarthire_stream_updates
+
+    state = dict(st.session_state.graph_state)
+    return run_smarthire_stream_updates(
+        user_input=user_input,
+        state=state,
+        session_id=st.session_state.session_id,
+    )
+
+
+def _render_resume_screening_section(resumes: list[dict]) -> None:
+    """Render Resume Screening results with a per-candidate detail view."""
+    st.markdown("### 📄 Resume Screening Results")
+    st.caption(
+        f"{len(resumes)} resume(s) screened. Select a candidate below to view details."
+    )
+
+    if not resumes:
+        _empty_state("📄", "No resumes screened", "Upload resumes to begin.")
+        return
+
+    names = [r.get("candidate_name", f"Candidate {i + 1}") for i, r in enumerate(resumes)]
+    selected = st.selectbox(
+        "Select candidate",
+        names,
+        key="screening_candidate_select",
+        label_visibility="collapsed",
+    )
+    idx = names.index(selected) if selected in names else 0
+    detail = resumes[idx]
+
+    with st.container(border=True):
+        st.markdown(f"#### {detail.get('candidate_name', 'Unknown')}")
+
+        skills = detail.get("skills", [])
+        if skills:
+            st.markdown("**Skills:**")
+            skill_tags = " ".join(
+                f"<span style='background:#E0F2FE;color:#0369A1;padding:2px 8px;"
+                f"border-radius:10px;font-size:0.82em;margin:2px;display:inline-block'>"
+                f"{s}</span>"
+                for s in skills
+            )
+            st.markdown(skill_tags, unsafe_allow_html=True)
+
+        education = detail.get("education", [])
+        if education:
+            st.markdown("**Education:**")
+            for edu in education:
+                if isinstance(edu, dict):
+                    degree = edu.get("degree", "")
+                    inst = edu.get("institution", "")
+                    year = edu.get("year", "")
+                    st.caption(f"• {degree} — {inst} ({year})" if year else f"• {degree} — {inst}")
+
+        summary = detail.get("summary", "")
+        if summary:
+            st.markdown("**Screening Summary:**")
+            st.info(summary)
+
+        extracted = detail.get("extracted_fields", {})
+        certs = extracted.get("certifications", [])
+        roles = extracted.get("past_roles", [])
+        if certs:
+            st.caption(f"**Certifications:** {', '.join(certs)}")
+        if roles:
+            with st.expander("Past roles"):
+                for role in roles:
+                    st.caption(f"• {role}")
+
+
+def _render_matching_section(rankings: list[dict]) -> None:
+    """Render Candidate Matching / ranking results."""
+    st.markdown("### 🎯 Candidate Rankings")
+    if not rankings:
+        _empty_state("🎯", "No rankings yet", "Candidate Matching is processing…")
+        return
+    st.markdown(
+        f"**{len(rankings)} candidate(s) ranked.** Click *Schedule Interview* "
+        "on any row to jump to Interview Scheduling."
+    )
+    _display_rankings(rankings)
+
+
+def _render_scheduling_section(slots: list[dict]) -> None:
+    """Render Interview Scheduling results."""
+    _display_interview_slots(slots)
+
+
+def _render_reflection_section(notes: dict) -> None:
+    """Render Reflection Node output."""
+    _render_reflection_summary(notes)
+
+
+# ── Staged pipeline runner ────────────────────────────────────────────
+
+
+def _run_with_progress(progress_title: str) -> None:
+    """Run the pipeline with incremental rendering of each agent's results.
+
+    Streams the graph using ``stream_mode="updates"``.  After each node
+    completes, its output is stored in ``st.session_state.graph_state`` and
+    rendered immediately below the progress indicator — so Resume Screening
+    results appear before Candidate Matching starts.
+    """
+    from graph import TransientError
+
+    completed: list[str] = []
+    running: str | None = None
+    workflow = st.session_state.graph_state.get("requested_workflow")
+
+    try:
+        with st.status(progress_title, expanded=True) as status:
+            status.update(label="Starting agents…", state="running")
+            progress_ph = st.empty()
+
+            for node_name, update in _iter_pipeline_updates(st.session_state.pending_input):
+                # Mark this node as completed
+                if node_name not in completed:
+                    completed.append(node_name)
+                running = None
+
+                # Merge the update into graph_state
+                state = dict(st.session_state.graph_state)
+                for key, value in update.items():
+                    if key == "conversation_history":
+                        # Append reducer: extend, don't replace
+                        state.setdefault("conversation_history", []).extend(value)
+                    elif isinstance(state.get(key), list) and isinstance(value, list):
+                        # Other list fields: extend if both are lists
+                        state.setdefault(key, []).extend(value)
+                    else:
+                        state[key] = value
+                st.session_state.graph_state = state
+
+                # Update progress indicator
+                status.update(
+                    label=f"✓ {_agent_label(node_name)} complete",
+                    state="running",
+                )
+                progress_ph.markdown(
+                    _stage_checklist(completed, running, workflow), unsafe_allow_html=True
+                )
+
+            status.update(label="✓ Pipeline complete", state="complete", expanded=False)
+            progress_ph.markdown(_stage_checklist(completed, None, workflow), unsafe_allow_html=True)
+
+    except TransientError as exc:
+        st.session_state.graph_state = _restore_state(st.session_state.session_id)
+        _show_paused_state(exc.node_name, exc.message)
+        return
+    except (ValueError, RuntimeError, KeyError) as exc:
+        msg = str(exc)
+        if "api_key" in msg.lower() or "auth" in msg.lower() or "permission" in msg.lower():
+            st.error(f"Gemini authentication failed: {msg}")
+        elif "quota" in msg.lower() or "limit" in msg.lower() or "429" in msg:
+            st.error(f"Gemini rate limit exceeded: {msg}")
+        elif "network" in msg.lower() or "timeout" in msg.lower() or "connect" in msg.lower():
+            st.error(f"Network error reaching Gemini: {msg}")
+        else:
+            st.error(f"Pipeline error: {msg}")
+        return
+
+    Database().clear_session_paused(st.session_state.session_id)
+    st.session_state.pop("paused_at_node", None)
+    st.session_state.pop("paused_error", None)
+    st.session_state.graph_state = _restore_state(st.session_state.session_id)
+
+
+def _render_stage(node_name: str, state: dict) -> None:
+    """Render the output section for a completed pipeline stage."""
+    if node_name == "resume_screening":
+        resumes = state.get("resumes", [])
+        if resumes:
+            _render_resume_screening_section(resumes)
+            st.divider()
+    elif node_name == "candidate_matching":
+        rankings = state.get("candidate_rankings", [])
+        if rankings:
+            _render_matching_section(rankings)
+            st.divider()
+    elif node_name == "interview_scheduling":
+        slots = state.get("interview_slots", [])
+        if slots:
+            _render_scheduling_section(slots)
+            st.divider()
+    elif node_name == "reflection":
+        notes = state.get("reflection_notes", {})
+        if notes:
+            _render_reflection_section(notes)
+            final = state.get("final_response", "")
+            if final:
+                st.info(f"**Summary:** {final}")
 
 
 def _schedule_candidate(name: str) -> None:
@@ -479,6 +900,57 @@ def _display_interview_slots(slots: list[dict]) -> None:
 # ── Chat rendering (agent-aware) ──────────────────────────────────────
 
 
+# Suggested questions shown above the chat input, per role.
+# Candidate chat is anonymous, so only GENERIC process questions are offered —
+# never personal questions like "What is my application status?" which this
+# chat cannot truthfully answer.
+_CANDIDATE_SUGGESTIONS = [
+    "Explain the hiring process.",
+    "How many interview rounds are there?",
+    "How long is the interview?",
+    "Is my interview online or onsite?",
+    "What happens after the interview?",
+    "How should I prepare?",
+    "What documents are required?",
+    "What skills are evaluated?",
+    "How long does the hiring process take?",
+    "Can I reschedule my interview?",
+    "Who should I contact?",
+]
+
+_RECRUITER_SUGGESTIONS = [
+    "Rank candidates",
+    "Screen resumes",
+    "Compare candidates",
+    "Schedule interviews",
+    "Hiring insights",
+    "Candidate summary",
+]
+
+
+def _current_role() -> str:
+    """Return 'candidate' or 'recruiter' from the active mode picker."""
+    return (
+        "candidate" if st.session_state.mode_picker == "Candidate" else "recruiter"
+    )
+
+
+def _render_suggestions(role: str) -> None:
+    """Render clickable suggested questions matching the user's role."""
+    questions = _CANDIDATE_SUGGESTIONS if role == "candidate" else _RECRUITER_SUGGESTIONS
+    st.caption("Try asking:")
+    cols = st.columns(3)
+    for i, question in enumerate(questions):
+        with cols[i % 3]:
+            if st.button(
+                question,
+                key=f"suggestion_{role}_{i}",
+                use_container_width=True,
+            ):
+                st.session_state.suggestion_input = question
+                st.rerun()
+
+
 def _render_chat(messages: list[dict]) -> None:
     """Render the transcript, badge-labelling each agent turn."""
     routing: list[str] = []
@@ -511,39 +983,105 @@ def _render_chat(messages: list[dict]) -> None:
 
 def _chat_section(input_placeholder: str) -> None:
     """Shared Chat UI used by both the Chat tab and Candidate Chat mode."""
-    _render_chat(st.session_state.chat_messages)
+    role = _current_role()
+    chat_messages = _active_chat()
 
-    if prompt := st.chat_input(input_placeholder):
+    # Queue the input, process it, then rerun.  This keeps the response in
+    # the transcript before the FAQ buttons instead of rendering an answer
+    # beneath suggestions (the inconsistent layout shown in the screenshots).
+    prompt = st.session_state.pop("pending_chat_prompt", None)
+    if not prompt:
+        prompt = st.session_state.pop("suggestion_input", None)
+
+    if prompt:
         audit = ChatAudit()
-        st.session_state.chat_messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        chat_messages.append({"role": "user", "content": prompt})
 
         if not _llm_ok:
-            answer = "The selected AI provider is not configured or reachable. Check your .env settings."
-            audit.log_turn(
-                st.session_state.session_id, user_content=prompt, answer=answer
-            )
-        else:
-            prior_count = len(
-                st.session_state.graph_state.get("conversation_history", [])
-            )
-            st.session_state.pending_input = prompt
-            _run_with_progress("Running SmartHire agents…")
-            result = st.session_state.graph_state
-            answer = result.get("final_response", "No response generated.")
+            _prov = (st.session_state.get("llm_provider") or "ollama").strip().lower()
+            if _prov == "gemini":
+                answer = "Add a Gemini API key in the sidebar to continue."
+            else:
+                answer = "Ollama is not reachable. Start `ollama serve` to continue."
             audit.log_turn(
                 st.session_state.session_id,
                 user_content=prompt,
-                result=result,
-                prior_history_count=prior_count,
+                answer=answer,
+                mode=role,
             )
+        else:
+            if role == "candidate":
+                # Candidate chat is generic KB Q&A — answer directly from the
+                # HR Assistant. Never run the recruiter pipeline here.
+                from graph import answer_candidate_query
 
-        st.session_state.chat_messages.append(
+                prior_answers = [
+                    m["content"]
+                    for m in chat_messages
+                    if m["role"] == "assistant"
+                ][-5:]
+                try:
+                    answer = answer_candidate_query(
+                        prompt,
+                        st.session_state.session_id,
+                        {"prior_answers": prior_answers},
+                    )
+                except Exception:
+                    logger.exception("Candidate chat failed")
+                    answer = (
+                        "Sorry, I couldn't process that request right now. "
+                        "Please try again in a moment."
+                    )
+                audit.log_turn(
+                    st.session_state.session_id,
+                    user_content=prompt,
+                    answer=answer,
+                    mode=role,
+                )
+            else:
+                # Recruiter chat answers directly from stored session results
+                # (screening/ranking/scheduling/insights) or the HR knowledge
+                # base. It never re-runs the multi-agent pipeline — results
+                # come from the 'Screen & Rank Candidates' workflow.
+                from graph import answer_recruiter_chat
+
+                prior_answers = [
+                    m["content"]
+                    for m in chat_messages
+                    if m["role"] == "assistant"
+                ][-5:]
+                try:
+                    answer = answer_recruiter_chat(
+                        prompt,
+                        st.session_state.session_id,
+                        dict(st.session_state.graph_state),
+                        {"prior_answers": prior_answers},
+                    )
+                except Exception:
+                    logger.exception("Recruiter chat failed")
+                    answer = (
+                        "Sorry, I couldn't process that request right now. "
+                        "Please try again in a moment."
+                    )
+                audit.log_turn(
+                    st.session_state.session_id,
+                    user_content=prompt,
+                    answer=answer,
+                    mode=role,
+                )
+
+        chat_messages.append(
             {"role": "assistant", "content": answer}
         )
-        with st.chat_message("assistant"):
-            st.markdown(answer)
+        st.rerun()
+
+    _render_chat(chat_messages)
+    _render_suggestions(role)
+
+    typed_prompt = st.chat_input(input_placeholder)
+    if typed_prompt:
+        st.session_state.pending_chat_prompt = typed_prompt
+        st.rerun()
 
 
 # ── Interview scheduling helpers ──────────────────────────────────────
@@ -620,6 +1158,9 @@ def _confirm_slot(slot: dict, candidate: str, idx: int) -> None:
         proposed_start=f"{slot['date']} {slot['time_start']}:00",
         proposed_end=f"{slot['date']} {slot['time_end']}:00",
         status="confirmed",
+        session_id=st.session_state.session_id,
+        interview_type=slot.get("interview_type"),
+        interviewer=slot.get("interviewer"),
     )
     sched = st.session_state.sched
     sched["slots"][idx]["confirmed"] = True
@@ -631,130 +1172,203 @@ def _confirm_slot(slot: dict, candidate: str, idx: int) -> None:
     st.rerun()
 
 
-def _render_scheduling_tab() -> None:
-    st.markdown("### 📅 Interview Scheduling")
-    st.caption(
-        "Pick a shortlisted candidate and confirm a slot. Grayed slots conflict "
-        "with the interviewer's calendar and are disabled."
-    )
-
-    candidates = _candidate_options()
-    if not candidates:
+def _render_session_interviews() -> None:
+    """Render the list of interviews scheduled in the current session."""
+    session_id = st.session_state.get("session_id", "")
+    if not session_id:
         _empty_state(
-            "🗓️",
-            "No candidates to schedule",
-            "Screen and rank resumes first, then return here to book interviews.",
+            "📋",
+            "No active session",
+            "Start a session to see scheduled interviews here.",
         )
         return
 
-    default_idx = 0
-    preselected = st.session_state.pop("schedule_candidate", None)
-    if preselected in candidates:
-        default_idx = candidates.index(preselected)
+    db = Database()
+    rows = db.get_interviews_by_session(session_id)
 
-    col_c, col_i, col_d = st.columns([2, 2, 2])
-    with col_c:
-        candidate = st.selectbox(
-            "Shortlisted candidate", candidates, index=default_idx
+    if not rows:
+        _empty_state(
+            "📋",
+            "No interviews scheduled yet",
+            "Go to 'Schedule New' to propose slots for a shortlisted candidate.",
         )
-    with col_i:
-        interviewer = st.selectbox(
-            "Interviewer", ["Bob Tech Lead", "Alice Manager", "Carol Director"]
-        )
-    with col_d:
-        date = st.date_input(
-            "Interview date",
-            value=datetime.datetime.now(datetime.UTC).date(),
-        ).isoformat()
+        return
 
-    if st.button("Propose available slots", type="primary", use_container_width=True):
-        st.session_state.sched = {
-            "candidate": candidate,
-            "interviewer": interviewer,
-            "date": date,
-            "slots": _propose_slots(candidate, date, interviewer),
-        }
+    # Group by date
+    by_date: dict[str, list] = defaultdict(list)
+    for row in rows:
+        start = row["proposed_start"] or ""
+        date_str = start[:10] if len(start) >= 10 else "Unknown"
+        by_date[date_str].append(row)
 
-    sched = st.session_state.get("sched")
-    if sched and sched["candidate"] == candidate and sched["interviewer"] == interviewer:
-        st.divider()
-        st.markdown(
-            f"**{sched['candidate']}** with {sched['interviewer']} on {sched['date']}"
-        )
-        columns = st.columns(3)
-        for idx, slot in enumerate(sched["slots"]):
-            with columns[idx % 3]:
-                if slot["conflict"]:
-                    with st.container(border=True):
-                        st.markdown(
-                            f"<div style='opacity:.55'>⛔ **{slot['time_start']}–{slot['time_end']}**"
-                            f"<br><small>{slot['interview_type']} · {slot['interviewer']}</small>"
-                            f"<br><span style='color:#B91C1C'>Conflict</span></div>",
-                            unsafe_allow_html=True,
-                        )
-                elif slot["confirmed"]:
-                    with st.container(border=True):
-                        st.markdown(
-                            f"✅ **{slot['time_start']}–{slot['time_end']}**"
-                            f"<br><small>{slot['interview_type']} · {slot['interviewer']}</small>"
-                            f"<br><span style='color:{_PRIMARY};font-weight:600'>Confirmed</span>",
-                            unsafe_allow_html=True,
-                        )
-                else:
-                    with st.container(border=True):
-                        st.markdown(
-                            f"**{slot['time_start']}–{slot['time_end']}**"
-                            f"<br><small>{slot['interview_type']} · {slot['interviewer']}</small>",
-                            unsafe_allow_html=True,
-                        )
+    # Sort dates soonest first
+    sorted_dates = sorted(by_date.keys())
+
+    for date_str in sorted_dates:
+        if len(sorted_dates) > 1:
+            st.markdown(f"**{date_str}**")
+
+        for row in by_date[date_str]:
+            interview_id = row["id"]
+            candidate = row["candidate_name"] or "Unknown"
+            interviewer_val = row["interviewer"] or "—"
+            interview_type = row["interview_type"] or "—"
+            status = row["status"] or "proposed"
+
+            start = row["proposed_start"] or ""
+            end = row["proposed_end"] or ""
+            time_display = f"{start[11:16]}–{end[11:16]}" if len(start) > 11 and len(end) > 11 else "—"
+
+            # Status badge colours
+            if status == "confirmed":
+                badge = (
+                    "<span style='color:#15803d;font-weight:600'>"
+                    "● Confirmed</span>"
+                )
+            elif status == "cancelled":
+                badge = (
+                    "<span style='color:#B91C1C;font-weight:600'>"
+                    "● Cancelled</span>"
+                )
+            else:
+                badge = (
+                    "<span style='color:#A16207;font-weight:600'>"
+                    "● Proposed</span>"
+                )
+
+            with st.container(border=True):
+                cols = st.columns([5, 1])
+                with cols[0]:
+                    st.markdown(
+                        f"**{candidate}** · {interview_type}<br>"
+                        f"<small>{interviewer_val} · {time_display}</small><br>"
+                        f"{badge}",
+                        unsafe_allow_html=True,
+                    )
+                with cols[1]:
+                    if status in ("confirmed", "proposed"):
                         if st.button(
-                            "Confirm interview",
-                            key=f"confirm_slot_{idx}",
+                            "Cancel",
+                            key=f"cancel_interview_{interview_id}",
                             use_container_width=True,
                         ):
-                            _confirm_slot(slot, candidate, idx)
+                            db.update_interview_status(interview_id, "cancelled")
+                            st.rerun()
+
+
+def _render_scheduling_tab() -> None:
+    st.markdown("### 📅 Interview Scheduling")
+
+    tab_new, tab_session = st.tabs(["Schedule New", "Session Interviews"])
+
+    with tab_new:
+        st.caption(
+            "Pick a shortlisted candidate and confirm a slot. Grayed slots "
+            "conflict with the interviewer's calendar and are disabled."
+        )
+
+        candidates = _candidate_options()
+        if not candidates:
+            _empty_state(
+                "🗓️",
+                "No candidates to schedule",
+                "Screen and rank resumes first, then return here to book interviews.",
+            )
+        else:
+            default_idx = 0
+            preselected = st.session_state.pop("schedule_candidate", None)
+            if preselected in candidates:
+                default_idx = candidates.index(preselected)
+
+            col_c, col_i, col_d = st.columns([2, 2, 2])
+            with col_c:
+                candidate = st.selectbox(
+                    "Shortlisted candidate", candidates, index=default_idx
+                )
+            with col_i:
+                interviewer = st.selectbox(
+                    "Interviewer",
+                    ["Bob Tech Lead", "Alice Manager", "Carol Director"],
+                )
+            with col_d:
+                date = st.date_input(
+                    "Interview date",
+                    value=datetime.datetime.now(datetime.UTC).date(),
+                ).isoformat()
+
+            if st.button(
+                "Propose available slots",
+                type="primary",
+                use_container_width=True,
+            ):
+                st.session_state.sched = {
+                    "candidate": candidate,
+                    "interviewer": interviewer,
+                    "date": date,
+                    "slots": _propose_slots(candidate, date, interviewer),
+                }
+
+            sched = st.session_state.get("sched")
+            if (
+                sched
+                and sched["candidate"] == candidate
+                and sched["interviewer"] == interviewer
+            ):
+                st.divider()
+                st.markdown(
+                    f"**{sched['candidate']}** with {sched['interviewer']} "
+                    f"on {sched['date']}"
+                )
+                columns = st.columns(3)
+                for idx, slot in enumerate(sched["slots"]):
+                    with columns[idx % 3]:
+                        if slot["conflict"]:
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"<div style='opacity:.55'>"
+                                    f"⛔ **{slot['time_start']}–{slot['time_end']}**"
+                                    f"<br><small>{slot['interview_type']} · "
+                                    f"{slot['interviewer']}</small>"
+                                    f"<br><span style='color:#B91C1C'>Conflict</span>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                        elif slot["confirmed"]:
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"✅ **{slot['time_start']}–{slot['time_end']}**"
+                                    f"<br><small>{slot['interview_type']} · "
+                                    f"{slot['interviewer']}</small>"
+                                    f"<br><span style='color:{_PRIMARY};"
+                                    f"font-weight:600'>Confirmed</span>",
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"**{slot['time_start']}–{slot['time_end']}**"
+                                    f"<br><small>{slot['interview_type']} · "
+                                    f"{slot['interviewer']}</small>",
+                                    unsafe_allow_html=True,
+                                )
+                                if st.button(
+                                    "Confirm interview",
+                                    key=f"confirm_slot_{idx}",
+                                    use_container_width=True,
+                                ):
+                                    _confirm_slot(slot, candidate, idx)
+
+    with tab_session:
+        _render_session_interviews()
 
 
 # ── System Insight ────────────────────────────────────────────────────
 
 
-def _routing_log(limit: int = 10) -> list[str]:
-    lines = []
-    for msg in st.session_state.graph_state.get("conversation_history", []):
-        content = getattr(msg, "content", "")
-        if isinstance(content, str) and content.startswith("[Supervisor]"):
-            lines.append(content)
-    return lines[-limit:]
-
-
-def _jd_chart(rankings: list) -> plt.Figure | None:
-    job_description = st.session_state.graph_state.get("job_description", {})
-    active_title = (
-        job_description.get("job_title")
-        or job_description.get("title")
-        or "Current job description"
-    )
-    counts = Counter(r.get("jd_title") or active_title for r in rankings)
-    if not counts:
-        return None
-    titles = list(counts.keys())
-    values = [counts[t] for t in titles]
-    fig, ax = plt.subplots(figsize=(8, max(2.2, 0.5 * len(titles))))
-    bars = ax.barh(titles, values, color=_PRIMARY)
-    ax.set_xlabel("Candidates")
-    ax.set_title("Candidates in this session")
-    ax.invert_yaxis()
-    for bar, value in zip(bars, values):
-        ax.text(bar.get_width() + 0.05, bar.get_y() + bar.get_height() / 2,
-                str(value), va="center")
-    plt.tight_layout()
-    return fig
-
-
 def _render_insight_tab() -> None:
     st.markdown("### 📊 Session Insight")
     st.caption(
-        f"Showing only data from the active session "
+        f"Showing only data from the loaded session "
         f"({st.session_state.session_id[:8]})."
     )
     state = st.session_state.graph_state
@@ -774,52 +1388,26 @@ def _render_insight_tab() -> None:
             "Uploaded or processed here",
         )
     with cols[1]:
-        _metric_card("Current session", "Active", "Separate from past sessions")
+        _metric_card(
+            "Active session",
+            st.session_state.session_id[:8],
+            "Currently loaded session",
+            active=True,
+        )
     with cols[2]:
         _metric_card("Avg match score", avg_score, "This session's ranking")
     with cols[3]:
         _metric_card("Interviews", str(len(interviews)), "This session's proposed slots")
-
-    st.divider()
-
-    with st.expander("Candidates in this session (chart)", expanded=True):
-        chart = _jd_chart(rankings)
-        if chart is None:
-            _empty_state(
-                "📊",
-                "No session ranking data yet",
-                "Run Screen & Rank Candidates in this session to populate the chart.",
-            )
-        else:
-            st.pyplot(chart)
-
-    with st.expander("Agent Routing Log (last 10 decisions)", expanded=False):
-        log_lines = _routing_log()
-        if log_lines:
-            st.code("\n".join(log_lines))
-        else:
-            st.caption(
-                "No routing decisions yet — the Supervisor's intent + routing "
-                "choices appear here after you chat or screen candidates."
-            )
-
-    with st.expander("Raw conversation history", expanded=False):
-        history = st.session_state.graph_state.get("conversation_history", [])
-        if history:
-            for msg in history:
-                st.write(f"**{type(msg).__name__}**: {str(msg.content)[:220]}")
-        else:
-            st.caption("No conversation yet.")
 
 
 # ── Upload & Screen tab ───────────────────────────────────────────────
 
 
 def _render_upload_tab() -> None:
-    st.markdown("### 📤 Resumes & Job Description")
+    st.markdown("### 📄 Resume Screening")
     st.caption(
-        "Upload resumes and a JD, then run the multi-agent pipeline. You'll see "
-        "each agent execute live and a ranked results table afterwards."
+        "Upload resumes and a job description, then extract a grounded screening "
+        "profile for each candidate. Ranking happens separately in Candidate Matching."
     )
 
     col_resume, col_jd = st.columns(2)
@@ -838,15 +1426,10 @@ def _render_upload_tab() -> None:
             label_visibility="collapsed",
         )
         if uploaded_resumes:
-            st.session_state.resume_texts = []
-            for f in uploaded_resumes:
-                text = (
-                    _extract_pdf_text(f)
-                    if f.type == "application/pdf"
-                    else f.read().decode("utf-8") if f.name.lower().endswith(".txt")
-                    else _extract_docx_text(f)
-                )
-                st.session_state.resume_texts.append({"name": f.name, "text": text})
+            st.session_state.resume_texts = [
+                _read_uploaded_document(uploaded_file)
+                for uploaded_file in uploaded_resumes
+            ]
             st.success(f"Loaded {len(st.session_state.resume_texts)} resume(s)")
         if st.session_state.resume_texts:
             with st.expander("Review extracted resume text"):
@@ -860,6 +1443,20 @@ def _render_upload_tab() -> None:
                         disabled=True,
                         key=f"resume_preview_{r['name']}",
                         label_visibility="collapsed",
+                    )
+            st.markdown("**Saved resume files**")
+            for r in st.session_state.resume_texts:
+                file_col, download_col = st.columns([3, 2])
+                with file_col:
+                    st.caption(f"📎 {r['name']}")
+                with download_col:
+                    st.download_button(
+                        "Download",
+                        data=r.get("content") or r["text"].encode("utf-8"),
+                        file_name=r["name"],
+                        mime=r.get("mime", "text/plain"),
+                        key=f"resume_download_{r['name']}",
+                        use_container_width=True,
                     )
         else:
             _empty_state(
@@ -881,7 +1478,9 @@ def _render_upload_tab() -> None:
             key="jd_source",
         )
 
-        jd_text = ""
+        stored_jd = st.session_state.jd_data or {}
+        jd_record = dict(stored_jd) if stored_jd else None
+        jd_text = stored_jd.get("text", "")
         if jd_option == "Upload file":
             jd_file = st.file_uploader(
                 "JD file",
@@ -890,23 +1489,33 @@ def _render_upload_tab() -> None:
                 label_visibility="collapsed",
             )
             if jd_file:
-                jd_text = (
-                    _extract_pdf_text(jd_file)
-                    if jd_file.type == "application/pdf"
-                    else jd_file.read().decode("utf-8") if jd_file.name.lower().endswith(".txt")
-                    else _extract_docx_text(jd_file)
-                )
+                jd_record = _read_uploaded_document(jd_file)
+                jd_text = jd_record["text"]
         elif jd_option == "Paste text":
             jd_text = st.text_area(
                 "Paste job description",
                 height=160,
+                value=stored_jd.get("text", ""),
+                key="jd_paste_text",
                 placeholder="Paste the full job description here…",
                 label_visibility="collapsed",
             )
+            jd_record = {
+                "name": "job-description.txt",
+                "text": jd_text,
+                "content": jd_text.encode("utf-8"),
+                "mime": "text/plain",
+            }
         else:
             jd_file = Path("data/sample_jd.txt")
             if jd_file.exists():
                 jd_text = jd_file.read_text(encoding="utf-8")
+                jd_record = {
+                    "name": jd_file.name,
+                    "text": jd_text,
+                    "content": jd_text.encode("utf-8"),
+                    "mime": "text/plain",
+                }
                 st.info("Using sample JD: Senior Full-Stack Developer")
 
         if jd_text:
@@ -920,6 +1529,20 @@ def _render_upload_tab() -> None:
                     key="jd_text_preview",
                     label_visibility="collapsed",
                 )
+            if jd_record:
+                st.markdown("**Saved job description file**")
+                file_col, download_col = st.columns([3, 2])
+                with file_col:
+                    st.caption(f"📎 {jd_record.get('name', 'job-description.txt')}")
+                with download_col:
+                    st.download_button(
+                        "Download",
+                        data=jd_record.get("content") or jd_text.encode("utf-8"),
+                        file_name=jd_record.get("name", "job-description.txt"),
+                        mime=jd_record.get("mime", "text/plain"),
+                        key="jd_download",
+                        use_container_width=True,
+                    )
         else:
             _empty_state(
                 "📝",
@@ -934,13 +1557,17 @@ def _render_upload_tab() -> None:
         st.caption("Upload at least one resume and a job description to enable screening.")
 
     if st.button(
-        "🚀 Screen & Rank Candidates",
+        "🚀 Run Resume Screening",
         type="primary",
         disabled=run_disabled,
         use_container_width=True,
     ):
         if not _llm_ok:
-            st.error("Cannot run: the selected AI provider is not configured or reachable. Check .env.")
+            _prov = (st.session_state.get("llm_provider") or "ollama").strip().lower()
+            if _prov == "gemini":
+                st.error("Add a Gemini API key in the sidebar to continue.")
+            else:
+                st.error("Cannot run: Ollama is not reachable. Start `ollama serve`.")
         else:
             # Persist the raw JD so it survives restarts, and thread its id
             # through state so agents can reference it.
@@ -952,8 +1579,32 @@ def _render_upload_tab() -> None:
             jd_id = Database().persist_job_description(
                 {}, raw_text=jd_text, source=jd_source
             )
+            uploads = [
+                {
+                    "kind": "resume",
+                    "filename": resume["name"],
+                    "mime_type": resume.get("mime"),
+                    "content": resume.get("content") or resume["text"].encode("utf-8"),
+                    "extracted_text": resume["text"],
+                }
+                for resume in st.session_state.resume_texts
+            ]
+            if jd_record:
+                uploads.append(
+                    {
+                        "kind": "job_description",
+                        "filename": jd_record.get("name", "job-description.txt"),
+                        "mime_type": jd_record.get("mime", "text/plain"),
+                        "content": jd_record.get("content") or jd_text.encode("utf-8"),
+                        "extracted_text": jd_text,
+                    }
+                )
+            Database().replace_session_uploads(st.session_state.session_id, uploads)
+            st.session_state.jd_data = jd_record
             st.session_state.graph_state = {
                 **st.session_state.graph_state,
+                "user_role": "recruiter",
+                "requested_workflow": "screening",
                 "job_description": {
                     "id": jd_id,
                     "title": jd_text.strip().splitlines()[0][:200]
@@ -962,55 +1613,100 @@ def _render_upload_tab() -> None:
                     "raw_text": jd_text,
                 },
                 "resume_inputs": list(st.session_state.resume_texts),
+                # A new screening run creates a new source snapshot.  Existing
+                # rankings must not appear to belong to it.
+                "candidate_rankings": [],
+                "reflection_notes": {},
+                "final_response": "",
+                "reflection_attempts": 0,
+                "retry_agent": None,
+                "reflection_feedback": None,
             }
-
-            resume_blocks = "\n\n".join(
-                f"=== RESUME: {r['name']} ===\n{r['text']}"
-                for r in st.session_state.resume_texts
-            )
-            combined = (
-                f"JOB DESCRIPTION:\n{jd_text}\n\n"
-                f"RESUMES:\n{resume_blocks}\n\n"
-                "Please screen these resumes against the JD and rank them."
-            )
-            prior_count = len(
-                st.session_state.graph_state.get("conversation_history", [])
-            )
-            st.session_state.pending_input = combined
-            _run_with_progress("Running multi-agent pipeline…")
-            ChatAudit().log_turn(
-                st.session_state.session_id,
-                result=st.session_state.graph_state,
-                prior_history_count=prior_count,
-            )
+            request = "Run resume screening for the uploaded resumes."
+            st.session_state.pending_input = request
+            st.session_state.last_user_input = request
+            _run_with_progress("Running resume screening…")
             st.session_state.show_results = True
 
     if st.session_state.get("show_results"):
         st.divider()
-        st.markdown("### 📊 Ranking Results")
         state = st.session_state.graph_state
-        final = state.get("final_response", "")
-        if final:
-            st.info(f"**Summary:** {final}")
 
-        rankings = state.get("candidate_rankings", [])
-        if rankings:
-            st.markdown(
-                f"**{len(rankings)} candidate(s) ranked.** Click *Schedule Interview* "
-                "on any row to jump to Interview Scheduling."
-            )
-            _display_rankings(rankings)
-        else:
-            _empty_state(
-                "🎯",
-                "No candidates ranked yet",
-                "Run Screen & Rank Candidates to populate the ranking table.",
-            )
-        _render_reflection_summary(state.get("reflection_notes", {}))
-        _display_interview_slots(state.get("interview_slots", []))
+        # Screening results stay in this workflow. Ranking has its own tab.
+        resumes = state.get("resumes", [])
+        if resumes:
+            _render_resume_screening_section(resumes)
+            st.info("Screening is complete. Open **Candidate Matching** to compare and rank this batch.")
+
         errors = state.get("error", "")
         if errors:
             st.error(f"Pipeline error: {errors}")
+
+        # Show paused state if the session was interrupted mid-pipeline
+        paused_node = st.session_state.get("paused_at_node")
+        if paused_node and state.get("requested_workflow") == "screening":
+            _show_paused_state(paused_node, st.session_state.get("paused_error", ""))
+
+
+def _render_matching_tab() -> None:
+    """Render the independent candidate-comparison workflow."""
+    st.markdown("### 🎯 Candidate Matching")
+    st.caption(
+        "Compare the completed screening batch against its job description. "
+        "This does not re-read or re-parse the resumes."
+    )
+
+    state = st.session_state.graph_state
+    resumes = state.get("resumes", [])
+    jd_data = state.get("job_description", {})
+    if not resumes or not jd_data.get("raw_text"):
+        _empty_state(
+            "🎯",
+            "Screening required",
+            "Complete Resume Screening with a job description before ranking candidates.",
+        )
+        return
+
+    st.success(f"Ready to compare {len(resumes)} screened candidate(s).")
+    st.caption(f"Job description: {jd_data.get('title') or 'Uploaded job description'}")
+
+    if st.button("🚀 Rank Screened Candidates", type="primary", use_container_width=True):
+        if not _llm_ok:
+            provider = (st.session_state.get("llm_provider") or "ollama").strip().lower()
+            st.error(
+                "Add a Gemini API key in the sidebar to continue."
+                if provider == "gemini"
+                else "Cannot run: Ollama is not reachable. Start `ollama serve`."
+            )
+        else:
+            st.session_state.graph_state = {
+                **state,
+                "user_role": "recruiter",
+                "requested_workflow": "matching",
+                "candidate_rankings": [],
+                "reflection_notes": {},
+                "final_response": "",
+                "reflection_attempts": 0,
+                "retry_agent": None,
+                "reflection_feedback": None,
+            }
+            request = "Rank the completed screening batch against the job description."
+            st.session_state.pending_input = request
+            st.session_state.last_user_input = request
+            _run_with_progress("Running candidate matching…")
+            st.session_state.show_results = True
+
+    rankings = st.session_state.graph_state.get("candidate_rankings", [])
+    if rankings:
+        st.divider()
+        _render_matching_section(rankings)
+        notes = st.session_state.graph_state.get("reflection_notes", {})
+        if notes:
+            _render_reflection_section(notes)
+
+    paused_node = st.session_state.get("paused_at_node")
+    if paused_node and st.session_state.graph_state.get("requested_workflow") == "matching":
+        _show_paused_state(paused_node, st.session_state.get("paused_error", ""))
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────
@@ -1038,30 +1734,92 @@ with st.sidebar:
         sessions = Database().get_sessions()
         if not sessions:
             st.caption("No past sessions yet.")
+        # Fixed order by original creation time (started_at), so loading a
+        # session never re-sorts it to the top.
+        sessions = sorted(
+            sessions,
+            key=lambda s: str(s["started_at"] or ""),
+            reverse=True,
+        )
         for s in sessions:
             sid = s["id"]
             mode_name = s["mode"].capitalize() if s["mode"] else "Unknown"
-            timestamp = str(s["last_active_at"])[:16]
+            timestamp = str(s["started_at"])[:16]
             label = f"{mode_name} · {timestamp} · {sid[:8]}"
             if sid == st.session_state.session_id:
-                label += " (active)"
-            st.button(
-                label,
-                key=f"past_session_{sid}",
-                use_container_width=True,
-                on_click=_load_past_session,
-                args=(sid,),
-            )
+                st.markdown(
+                    f"<div style='background:#ECFDF5;border:1px solid #22C55E;"
+                    f"border-radius:8px;padding:8px 10px;margin-bottom:6px'>"
+                    f"<span style='color:#16A34A;font-weight:700'>● {label} — "
+                    f"active</span></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.button(
+                    label,
+                    key=f"past_session_{sid}",
+                    use_container_width=True,
+                    on_click=_load_past_session,
+                    args=(sid,),
+                )
 
     st.divider()
 
+    st.markdown("#### Model Provider")
+    _provider = st.segmented_control(
+        "Provider",
+        options=["Ollama", "Gemini"],
+        key="llm_provider",
+        label_visibility="collapsed",
+    )
+
     _llm_ok = _check_llm()
-    _provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
-    if _llm_ok:
-        st.success(f"{_provider.title()} ready", icon="✅")
+
+    if _provider == "Ollama":
+        if _llm_ok:
+            st.success("Ollama connected", icon="✅")
+        else:
+            st.error("Ollama is not reachable", icon="❌")
+            st.caption("Start Ollama with `ollama serve` before continuing.")
     else:
-        st.error(f"{_provider.title()} is not ready", icon="❌")
-        st.caption("Set provider settings in .env; for local Ollama, start `ollama serve`.")
+        _key = st.text_input(
+            "Gemini API key",
+            type="password",
+            value=st.session_state.gemini_api_key,
+            placeholder="Paste your Gemini API key…",
+            key="gemini_key_input",
+            label_visibility="collapsed",
+        )
+        if _key != st.session_state.gemini_api_key:
+            st.session_state.gemini_api_key = _key
+
+        if _key.strip():
+            if st.button(
+                "Save & Connect",
+                use_container_width=True,
+                key="gemini_connect_btn",
+            ):
+                with st.spinner("Validating Gemini API key…"):
+                    try:
+                        from langchain_google_genai import ChatGoogleGenerativeAI
+
+                        _test_llm = ChatGoogleGenerativeAI(
+                            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                            google_api_key=_key.strip(),
+                            temperature=0,
+                        )
+                        _test_llm.invoke("ping")
+                        st.success("Gemini connected", icon="✅")
+                        st.session_state.gemini_connected = True
+                    except (ValueError, RuntimeError, KeyError) as exc:
+                        st.error(f"Gemini connection failed: {exc}", icon="❌")
+                        st.session_state.gemini_connected = False
+            elif st.session_state.get("gemini_connected"):
+                st.success("Gemini connected", icon="✅")
+            else:
+                st.warning("Enter your API key and click Save & Connect.", icon="⚠️")
+        else:
+            st.caption("Enter your Gemini API key to enable cloud inference.")
 
     st.divider()
 
@@ -1073,6 +1831,10 @@ with st.sidebar:
         _reset_current_session()
         st.rerun()
 
+    if st.button("Clear All Sessions", type="secondary", use_container_width=True):
+        _clear_all_sessions()
+        st.rerun()
+
 
 # ── Recruiter Dashboard ───────────────────────────────────────────────
 
@@ -1080,24 +1842,27 @@ if is_recruiter:
     st.header("📋 Recruiter Dashboard")
     if flash := st.session_state.pop("flash", None):
         st.success(flash)
-    st.caption("Pipeline: upload → screen & rank → schedule → chat → insight.")
+    st.caption("Workflow: screen resumes → match candidates → schedule → chat → insight.")
 
     recruiter_tab = st.segmented_control(
         "Recruiter sections",
-        options=["Upload & Screen", "Interview Scheduling", "Chat", "System Insight"],
+        options=["Resume Screening", "Candidate Matching", "Interview Scheduling", "Chat", "System Insight"],
         key="recruiter_tab",
         label_visibility="collapsed",
     )
 
-    if recruiter_tab == "Upload & Screen":
+    if recruiter_tab == "Resume Screening":
         _render_upload_tab()
+    elif recruiter_tab == "Candidate Matching":
+        _render_matching_tab()
     elif recruiter_tab == "Interview Scheduling":
         _render_scheduling_tab()
     elif recruiter_tab == "Chat":
         st.markdown("### 💬 Chat with SmartHire AI")
         st.caption(
-            "Messages are labelled with the agent that produced them, so you can "
-            "see the multi-agent routing in action."
+            "Ask about your screened resumes, candidate rankings, interview "
+            "slots, or hiring insights — or ask HR process questions. Answers "
+            "come directly from your session results and the knowledge base."
         )
         _chat_section("Ask SmartHire AI anything…")
     else:
@@ -1108,7 +1873,9 @@ if is_recruiter:
 else:
     st.header("💬 Candidate Chat")
     st.caption(
-        "Ask questions about the recruitment process, interview prep, or "
-        "application status."
+        "Ask general questions about the recruitment process, interview "
+        "preparation, and what to expect. Answers come from our knowledge "
+        "base. This is an anonymous chat, so individual application details "
+        "are not shown here."
     )
     _chat_section("Ask an HR question…")

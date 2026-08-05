@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from db.database import Database
+from utils.observability import instrument_tool_methods
 
 logger = logging.getLogger(__name__)
 
 
+@instrument_tool_methods
 class CandidateDatabase:
     """SQLite-based read/query layer for candidate records."""
 

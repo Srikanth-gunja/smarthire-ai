@@ -68,27 +68,47 @@ class ChatAudit:
         role: str,
         content: str,
         agent_name: str | None = None,
+        mode: str | None = None,
     ) -> str | None:
-        """Persist a single message immediately (not batched)."""
-        return self.db.insert_chat_message(session_id, role, content, agent_name)
+        """Persist a single message immediately (not batched).
 
-    def log_user(self, session_id: str, content: str) -> str | None:
+        Args:
+            session_id: The session this turn belongs to.
+            role: 'user', 'assistant', or 'agent:<agent_name>'.
+            content: The message text.
+            agent_name: The agent that produced this turn (None for user turns).
+            mode: 'recruiter' | 'candidate' transcript owner (None = legacy).
+        """
+        return self.db.insert_chat_message(
+            session_id, role, content, agent_name, mode
+        )
+
+    def log_user(
+        self, session_id: str, content: str, mode: str | None = None
+    ) -> str | None:
         """Persist a user turn."""
-        return self.log_message(session_id, "user", content)
+        return self.log_message(session_id, "user", content, mode=mode)
 
-    def log_assistant(self, session_id: str, content: str) -> str | None:
+    def log_assistant(
+        self, session_id: str, content: str, mode: str | None = None
+    ) -> str | None:
         """Persist an assistant turn."""
-        return self.log_message(session_id, "assistant", content)
+        return self.log_message(session_id, "assistant", content, mode=mode)
 
     def log_agent(
         self,
         session_id: str,
         agent_name: str,
         content: str,
+        mode: str | None = None,
     ) -> str | None:
         """Persist an agent turn with role 'agent:<agent_name>'."""
         return self.log_message(
-            session_id, f"agent:{agent_name}", content, agent_name=agent_name
+            session_id,
+            f"agent:{agent_name}",
+            content,
+            agent_name=agent_name,
+            mode=mode,
         )
 
     def log_turn(
@@ -98,6 +118,7 @@ class ChatAudit:
         result: dict | None = None,
         answer: str | None = None,
         prior_history_count: int = 0,
+        mode: str | None = None,
     ) -> None:
         """Persist one full turn: user prompt, agent notes, final answer.
 
@@ -112,21 +133,25 @@ class ChatAudit:
                 (e.g. Ollama is unreachable).
             prior_history_count: Number of conversation_history messages that
                 already existed before this turn, so only new ones are logged.
+            mode: 'recruiter' | 'candidate' transcript owner (None = legacy).
         """
         if user_content:
-            self.log_user(session_id, user_content)
+            self.log_user(session_id, user_content, mode=mode)
 
         if result is not None:
             history = result.get("conversation_history", [])
             for msg in history[prior_history_count:]:
                 agent_name, text = self._extract_agent_turn(msg)
                 if agent_name:
-                    self.log_agent(session_id, agent_name, text)
-            final = (result.get("final_response") or "").strip()
+                    self.log_agent(session_id, agent_name, text, mode=mode)
+            final_val = result.get("final_response") or ""
+            if isinstance(final_val, list):
+                final_val = " ".join(str(m) for m in final_val)
+            final = str(final_val).strip()
             if final:
-                self.log_assistant(session_id, final)
+                self.log_assistant(session_id, final, mode=mode)
         elif answer:
-            self.log_assistant(session_id, answer)
+            self.log_assistant(session_id, answer, mode=mode)
 
     @staticmethod
     def _extract_agent_turn(msg: Any) -> tuple[str | None, str]:
@@ -148,6 +173,7 @@ class ChatAudit:
         self,
         session_id: str,
         display_only: bool = True,
+        mode: str | None = None,
     ) -> list[dict]:
         """Return a session's chat messages, oldest first.
 
@@ -155,13 +181,15 @@ class ChatAudit:
             session_id: The session to read from.
             display_only: When True (default), only user/assistant turns are
                 returned — agent turns stay in the table as an audit trail.
+            mode: Optional 'recruiter' | 'candidate' to restrict to one
+                transcript. When None, all modes are returned.
 
         Returns:
             List of dicts with keys 'role', 'content', 'agent_name',
             'created_at'.
         """
         messages: list[dict] = []
-        for row in self.db.get_chat_messages(session_id):
+        for row in self.db.get_chat_messages(session_id, mode=mode):
             if display_only and row["role"] not in DISPLAY_ROLES:
                 continue
             messages.append(
@@ -174,9 +202,15 @@ class ChatAudit:
             )
         return messages
 
-    def clear(self, session_id: str) -> None:
-        """Remove all chat messages for a session."""
-        self.db.delete_chat_messages(session_id)
+    def clear(self, session_id: str, mode: str | None = None) -> None:
+        """Remove chat messages for a session.
+
+        Args:
+            session_id: The session to clear.
+            mode: Optional 'recruiter' | 'candidate' to clear only one
+                transcript. When None, every transcript is removed.
+        """
+        self.db.delete_chat_messages(session_id, mode=mode)
 
     # ── Session mirror file ───────────────────────────────────────────
 

@@ -33,12 +33,22 @@ class SmartHireState(TypedDict, total=False):
     # Append reducer: each node's messages are added, not replaced.
     conversation_history: Annotated[list[BaseMessage], operator.add]
 
+    # Role of the current user: "recruiter" (default) or "candidate".
+    # Drives role-aware routing, HR assistant context, and the final
+    # response so candidate and recruiter experiences never mix.
+    user_role: str
+
     # ── Supervisor Output ────────────────────────────────────────────
     # Classified intent from the Supervisor for this turn.
     current_intent: str
 
     # Which agents were invoked this turn (e.g. ["resume_screening", "candidate_matching"]).
     active_agents: list[str]
+
+    # Optional UI-directed workflow.  Recruiter buttons use this to invoke
+    # exactly one workflow without asking the LLM supervisor to infer intent.
+    # This keeps Screening and Matching independent and reduces remote LLM calls.
+    requested_workflow: str
 
     # ── Resume Screening Agent Output ────────────────────────────────
     # List of parsed resume dicts, each containing structured fields

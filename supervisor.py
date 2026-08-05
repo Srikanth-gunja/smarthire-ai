@@ -52,6 +52,12 @@ SUPERVISOR_PROMPT = ChatPromptTemplate.from_messages([
         "- If the user wants multiple things (e.g., 'screen resumes AND schedule interviews'), "
         "classify as multi_intent and list all relevant agents in execution order.\n"
         "- If the user is greeting or making small talk → greeting (use hr_assistant)\n\n"
+        "ROLE AWARENESS:\n"
+        "The user's role is {user_role}. A candidate must NEVER be routed to "
+        "resume_screening, candidate_matching, or interview_scheduling — those are "
+        "recruiter-only tools. Candidate questions (application status, interview "
+        "details, preparation, documents, process) are always handled by hr_assistant."
+        "\n\n"
         "Execution order for multi_intent:\n"
         "1. resume_screening first (to parse/screen resumes)\n"
         "2. candidate_matching second (to rank screened resumes)\n"
@@ -107,8 +113,11 @@ class Supervisor:
         Uses structured output (Pydantic) for deterministic routing —
         no free-text parsing or string matching on LLM output.
 
+        After classification, a role policy is applied so candidate users
+        are only ever routed to the HR Assistant.
+
         Args:
-            input_data: The user query and conversation history.
+            input_data: The user query, conversation history, and role.
 
         Returns:
             An ExecutionPlan with intent, agents to invoke, and reasoning.
@@ -128,6 +137,7 @@ class Supervisor:
             result = chain.invoke({
                 "query": input_data.user_query,
                 "history": history_str,
+                "user_role": input_data.user_role,
             })
 
             # Validate agents against allowlist
@@ -137,20 +147,43 @@ class Supervisor:
                     "LLM returned no valid agents (got %s), using fallback",
                     result.agents_to_invoke,
                 )
-                return self._fallback_classify(input_data.user_query)
+                return self._fallback_classify(
+                    input_data.user_query, input_data.user_role
+                )
 
             result.agents_to_invoke = valid_agents
-            return result
+            return self._apply_role_policy(result, input_data.user_role)
 
         except Exception:
             logger.exception("LLM classification failed, using keyword fallback")
-            return self._fallback_classify(input_data.user_query)
+            return self._fallback_classify(
+                input_data.user_query, input_data.user_role
+            )
 
-    def _fallback_classify(self, query: str) -> ExecutionPlan:
+    def _apply_role_policy(self, plan: ExecutionPlan, role: str) -> ExecutionPlan:
+        """Constrain routing based on the user's role.
+
+        Candidates are only allowed to talk to the HR Assistant. Greetings,
+        HR questions, and even recruiter-style phrasing ("screen resumes",
+        "rank candidates") are routed to hr_assistant so the candidate
+        experience never mixes with recruiter tools.
+        """
+        if role != "candidate":
+            return plan
+
+        plan.intent = "hr_question"
+        plan.agents_to_invoke = ["hr_assistant"]
+        plan.reasoning = (
+            "Candidate role: all questions are handled by the HR Assistant."
+        )
+        return plan
+
+    def _fallback_classify(self, query: str, role: str = "recruiter") -> ExecutionPlan:
         """Keyword-based fallback when LLM classification fails.
 
         Args:
             query: The raw user query.
+            role: The user's role ('recruiter' default, or 'candidate').
 
         Returns:
             An ExecutionPlan derived from keyword matching.
@@ -163,6 +196,14 @@ class Supervisor:
             if keyword in query_lower and agent not in seen:
                 matched_agents.append(agent)
                 seen.add(agent)
+
+        if role == "candidate":
+            # Candidates never get recruiter tools via fallback either.
+            return ExecutionPlan(
+                intent="hr_question",
+                agents_to_invoke=["hr_assistant"],
+                reasoning="Candidate role: defaulting to HR assistant.",
+            )
 
         if not matched_agents:
             return ExecutionPlan(

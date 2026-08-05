@@ -28,6 +28,10 @@ class SupervisorInput(BaseModel):
         default_factory=list,
         description="Serialized prior messages for context.",
     )
+    user_role: str = Field(
+        default="recruiter",
+        description="Role of the current user: 'recruiter' or 'candidate'.",
+    )
 
 
 class ExecutionPlan(BaseModel):
@@ -188,6 +192,10 @@ class HRAssistantInput(BaseModel):
     """Input to the HR Assistant Agent."""
 
     query: str = Field(description="The candidate or recruiter question.")
+    user_role: str = Field(
+        default="recruiter",
+        description="Role of the user asking: 'candidate' or 'recruiter'.",
+    )
     context: dict = Field(
         default_factory=dict,
         description="Optional conversation context for grounding the answer.",

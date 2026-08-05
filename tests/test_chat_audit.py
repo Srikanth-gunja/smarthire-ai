@@ -89,6 +89,48 @@ class TestLogAndLoad:
         audit.clear(sid)
         assert audit.load_messages(sid) == []
 
+    def test_modes_are_isolated(self, session):
+        """Candidate and recruiter transcripts never mix."""
+        audit, sid = session
+        audit.log_user(sid, "candidate question", mode="candidate")
+        audit.log_assistant(sid, "candidate answer", mode="candidate")
+        audit.log_user(sid, "recruiter question", mode="recruiter")
+
+        candidate_msgs = audit.load_messages(sid, mode="candidate")
+        recruiter_msgs = audit.load_messages(sid, mode="recruiter")
+
+        assert [m["content"] for m in candidate_msgs] == [
+            "candidate question",
+            "candidate answer",
+        ]
+        assert [m["content"] for m in recruiter_msgs] == ["recruiter question"]
+
+    def test_log_turn_respects_mode(self, session):
+        """log_turn tags every turn of the transcript with the given mode."""
+        audit, sid = session
+        audit.log_turn(
+            sid,
+            user_content="Explain recruitment?",
+            answer="The process has 5 stages.",
+            mode="candidate",
+        )
+        candidate_msgs = audit.load_messages(sid, mode="candidate")
+        assert [m["role"] for m in candidate_msgs] == ["user", "assistant"]
+        rows = audit.db.get_chat_messages(sid, mode="candidate")
+        assert all(r["mode"] == "candidate" for r in rows)
+        assert audit.load_messages(sid, mode="recruiter") == []
+
+    def test_clear_by_mode_keeps_other_mode(self, session):
+        """clear(mode=...) only removes the matching transcript."""
+        audit, sid = session
+        audit.log_user(sid, "candidate msg", mode="candidate")
+        audit.log_user(sid, "recruiter msg", mode="recruiter")
+        audit.clear(sid, mode="candidate")
+        assert audit.load_messages(sid, mode="candidate") == []
+        assert [m["content"] for m in audit.load_messages(sid, mode="recruiter")] == [
+            "recruiter msg"
+        ]
+
 
 # ── log_turn ──────────────────────────────────────────────────────────
 

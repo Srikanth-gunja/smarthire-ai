@@ -25,6 +25,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from utils.observability import instrument_tool_methods
+
 logger = logging.getLogger(__name__)
 
 DB_DIR = Path(__file__).resolve().parent
@@ -52,6 +54,7 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
+@instrument_tool_methods
 class Database:
     """Small ``sqlite3`` connection manager plus persistence helpers.
 
@@ -77,8 +80,69 @@ class Database:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(str(self.db_path), timeout=30) as conn:
+            # Run migrations first so new columns exist before any indexes
+            # in schema.sql that reference them.
+            self._migrate_sessions(conn)
+            self._migrate_interviews(conn)
+            self._migrate_chat_messages(conn)
             conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         self._schema_ready = True
+
+    @staticmethod
+    def _migrate_sessions(conn: sqlite3.Connection) -> None:
+        """Add new columns to the sessions table for existing databases."""
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'"
+            )
+            if not cursor.fetchone():
+                return  # table doesn't exist yet; schema.sql will create it
+            cursor = conn.execute("PRAGMA table_info(sessions)")
+            existing = {row[1] for row in cursor.fetchall()}
+        except Exception:
+            return
+        if "paused_at_node" not in existing:
+            conn.execute("ALTER TABLE sessions ADD COLUMN paused_at_node TEXT")
+        if "error_message" not in existing:
+            conn.execute("ALTER TABLE sessions ADD COLUMN error_message TEXT")
+
+    @staticmethod
+    def _migrate_interviews(conn: sqlite3.Connection) -> None:
+        """Add new columns to the interviews table for existing databases."""
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='interviews'"
+            )
+            if not cursor.fetchone():
+                return  # table doesn't exist yet; schema.sql will create it
+            cursor = conn.execute("PRAGMA table_info(interviews)")
+            existing = {row[1] for row in cursor.fetchall()}
+        except Exception:
+            return
+        if "session_id" not in existing:
+            conn.execute("ALTER TABLE interviews ADD COLUMN session_id TEXT")
+        if "interview_type" not in existing:
+            conn.execute(
+                "ALTER TABLE interviews ADD COLUMN interview_type TEXT DEFAULT 'technical'"
+            )
+        if "interviewer" not in existing:
+            conn.execute("ALTER TABLE interviews ADD COLUMN interviewer TEXT")
+
+    @staticmethod
+    def _migrate_chat_messages(conn: sqlite3.Connection) -> None:
+        """Add the mode column to chat_messages for existing databases."""
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='chat_messages'"
+            )
+            if not cursor.fetchone():
+                return  # table doesn't exist yet; schema.sql will create it
+            cursor = conn.execute("PRAGMA table_info(chat_messages)")
+            existing = {row[1] for row in cursor.fetchall()}
+        except Exception:  # noqa: BLE001
+            return
+        if "mode" not in existing:
+            conn.execute("ALTER TABLE chat_messages ADD COLUMN mode TEXT")
 
     # ── Connections ────────────────────────────────────────────────────
 
@@ -174,6 +238,99 @@ class Database:
             "SELECT * FROM sessions "
             "ORDER BY last_active_at DESC, started_at DESC, rowid DESC"
         )
+
+    def replace_session_uploads(self, session_id: str, uploads: list[dict]) -> None:
+        """Replace the original documents retained for one recruiter session."""
+        try:
+            with self.connect() as conn:
+                conn.execute("DELETE FROM session_uploads WHERE session_id = ?", (session_id,))
+                conn.executemany(
+                    """
+                    INSERT INTO session_uploads
+                        (id, session_id, kind, filename, mime_type, content, extracted_text)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            _new_id(),
+                            session_id,
+                            upload["kind"],
+                            upload["filename"],
+                            upload.get("mime_type"),
+                            sqlite3.Binary(upload["content"]),
+                            upload["extracted_text"],
+                        )
+                        for upload in uploads
+                    ],
+                )
+        except (sqlite3.Error, KeyError, TypeError):
+            logger.exception("Failed to save uploads for session %s", session_id)
+
+    def get_session_uploads(self, session_id: str) -> list[sqlite3.Row]:
+        """Return a session's retained documents in their saved order."""
+        return self.fetch_all(
+            "SELECT * FROM session_uploads WHERE session_id = ? ORDER BY created_at, rowid",
+            (session_id,),
+        )
+
+    def delete_session_uploads(self, session_id: str) -> None:
+        """Delete the documents retained for one session."""
+        self.execute("DELETE FROM session_uploads WHERE session_id = ?", (session_id,))
+
+    def delete_session_data(self, session_id: str) -> None:
+        """Delete records that directly belong to one session before its row."""
+        for table in ("session_uploads", "chat_messages", "hr_answers", "interviews"):
+            self.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+
+    def clear_all_hiring_data(self) -> None:
+        """Erase every session and all persisted SmartHire workflow records."""
+        tables = [
+            "session_uploads", "chat_messages", "hr_answers", "interviews",
+            "candidate_rankings", "screenings", "candidates", "job_descriptions", "sessions",
+        ]
+        try:
+            with self.connect() as conn:
+                for table in tables:
+                    conn.execute(f"DELETE FROM {table}")
+        except sqlite3.Error:
+            logger.exception("Failed to clear all SmartHire data")
+
+    def update_session_paused(
+        self, session_id: str, node_name: str, error_message: str
+    ) -> None:
+        """Mark a session as paused due to a transient error."""
+        self.execute(
+            """
+            UPDATE sessions
+            SET paused_at_node = ?, error_message = ?, last_active_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (node_name, error_message, session_id),
+        )
+
+    def clear_session_paused(self, session_id: str) -> None:
+        """Clear the paused state after a successful resume or retry."""
+        self.execute(
+            """
+            UPDATE sessions
+            SET paused_at_node = NULL, error_message = NULL, last_active_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (session_id,),
+        )
+
+    def get_session_paused(self, session_id: str) -> dict | None:
+        """Return the paused state for a session, or None if not paused."""
+        row = self.fetch_one(
+            "SELECT paused_at_node, error_message FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+        if row and row["paused_at_node"]:
+            return {
+                "paused_at_node": row["paused_at_node"],
+                "error_message": row["error_message"] or "",
+            }
+        return None
 
     # ── Job descriptions ───────────────────────────────────────────────
 
@@ -385,6 +542,9 @@ class Database:
         proposed_start: str | None = None,
         proposed_end: str | None = None,
         status: str = "proposed",
+        session_id: str | None = None,
+        interview_type: str | None = None,
+        interviewer: str | None = None,
     ) -> str | None:
         """Persist one Interview Scheduling Agent output row."""
         if status not in INTERVIEW_STATUSES:
@@ -393,10 +553,14 @@ class Database:
         self.execute(
             """
             INSERT INTO interviews
-                (id, candidate_id, jd_id, proposed_start, proposed_end, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (id, candidate_id, jd_id, session_id, proposed_start, proposed_end,
+                 interview_type, interviewer, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (interview_id, candidate_id, jd_id, proposed_start, proposed_end, status),
+            (
+                interview_id, candidate_id, jd_id, session_id,
+                proposed_start, proposed_end, interview_type, interviewer, status,
+            ),
         )
         return interview_id
 
@@ -411,6 +575,30 @@ class Database:
             ORDER BY i.created_at DESC
             """
         )
+
+    def get_interviews_by_session(self, session_id: str) -> list[sqlite3.Row]:
+        """Return interview rows for a specific session, soonest first."""
+        return self.fetch_all(
+            """
+            SELECT i.*, c.name AS candidate_name, jd.title AS jd_title
+            FROM interviews i
+            LEFT JOIN candidates c ON c.id = i.candidate_id
+            LEFT JOIN job_descriptions jd ON jd.id = i.jd_id
+            WHERE i.session_id = ?
+            ORDER BY i.proposed_start ASC
+            """,
+            (session_id,),
+        )
+
+    def update_interview_status(self, interview_id: str, status: str) -> bool:
+        """Update the status of an interview. Returns True if a row was changed."""
+        if status not in INTERVIEW_STATUSES:
+            return False
+        cursor = self.execute(
+            "UPDATE interviews SET status = ? WHERE id = ?",
+            (status, interview_id),
+        )
+        return cursor.rowcount > 0
 
     # ── HR answers ─────────────────────────────────────────────────────
 
@@ -457,6 +645,7 @@ class Database:
         role: str,
         content: str,
         agent_name: str | None = None,
+        mode: str | None = None,
     ) -> str | None:
         """Persist one chat turn for a session (human-readable audit log).
 
@@ -465,6 +654,8 @@ class Database:
             role: 'user', 'assistant', or 'agent:<agent_name>'.
             content: The message text.
             agent_name: The agent that produced this turn (None for user turns).
+            mode: 'recruiter' | 'candidate' owning this transcript (None for
+                legacy rows written before mode separation).
 
         Returns:
             The new row id, or None if the write failed.
@@ -472,41 +663,61 @@ class Database:
         message_id = _new_id()
         self.execute(
             """
-            INSERT INTO chat_messages (id, session_id, role, content, agent_name)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO chat_messages (id, session_id, role, content, agent_name, mode)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (message_id, session_id, role, content, agent_name),
+            (message_id, session_id, role, content, agent_name, mode),
         )
         return message_id
 
     def get_chat_messages(
         self,
         session_id: str,
+        mode: str | None = None,
         limit: int | None = None,
     ) -> list[sqlite3.Row]:
         """Return a session's chat messages, oldest first.
 
         Args:
             session_id: The session to read from.
+            mode: Optional 'recruiter' | 'candidate' to restrict to one
+                transcript. When None, all modes are returned.
             limit: Max recent messages to return (None = all).
 
         Returns:
             List of chat_messages rows ordered oldest → newest.
         """
-        sql = (
-            "SELECT * FROM chat_messages WHERE session_id = ? "
-            "ORDER BY created_at ASC, rowid ASC"
-        )
+        sql = "SELECT * FROM chat_messages WHERE session_id = ?"
+        params: list[Any] = [session_id]
+        if mode:
+            sql += " AND mode = ?"
+            params.append(mode)
+        sql += " ORDER BY created_at ASC, rowid ASC"
         if limit is not None:
             sql += " LIMIT ?"
-            params: Sequence[Any] = (session_id, limit)
-        else:
-            params = (session_id,)
-        return self.fetch_all(sql, params)
+            params.append(limit)
+        return self.fetch_all(sql, tuple(params))
 
-    def delete_chat_messages(self, session_id: str) -> None:
-        """Remove all chat messages for a session (used by Clear Session)."""
-        self.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+    def delete_chat_messages(
+        self, session_id: str, mode: str | None = None
+    ) -> None:
+        """Remove chat messages for a session (used by Clear Session).
+
+        Args:
+            session_id: The session to clear.
+            mode: Optional 'recruiter' | 'candidate' to clear only one
+                transcript. When None, every transcript for the session is
+                removed.
+        """
+        if mode:
+            self.execute(
+                "DELETE FROM chat_messages WHERE session_id = ? AND mode = ?",
+                (session_id, mode),
+            )
+        else:
+            self.execute(
+                "DELETE FROM chat_messages WHERE session_id = ?", (session_id,)
+            )
 
 
 def _sniff_title(raw_text: str | None) -> str | None:

@@ -15,6 +15,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from tools.skill_normalizer import extract_skills_from_text, normalize_skill_list
+from utils.observability import instrument_tool_methods
 
 if TYPE_CHECKING:
     from langchain_ollama import ChatOllama
@@ -55,6 +56,7 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
+@instrument_tool_methods
 class ResumeParser:
     """Parses resume text and extracts structured candidate data using the LLM."""
 

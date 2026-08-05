@@ -15,6 +15,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from tools.skill_normalizer import normalize_skill_list
+from utils.observability import instrument_tool_methods
 
 if TYPE_CHECKING:
     from langchain_ollama import ChatOllama
@@ -55,6 +56,7 @@ JD_ANALYSIS_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
+@instrument_tool_methods
 class JDAnalyzer:
     """Analyzes job descriptions and extracts structured requirements using the LLM."""
 

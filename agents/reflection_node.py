@@ -317,26 +317,29 @@ def check_all_questions_answered(state: SmartHireState) -> dict:
             )
             retry_hint = "hr_assistant"
 
-    screen_keywords = {"screen", "resume", "cv", "parse"}
-    if tokens & screen_keywords and not state.get("resumes"):
-        issues.append(
-            "User requested resume screening but no resumes were produced."
-        )
-        retry_hint = "resume_screening"
+    # Recruiter-only workflow checks: candidate chats never invoke the
+    # screening/ranking/scheduling agents, so those must not be flagged.
+    if state.get("user_role", "recruiter") != "candidate":
+        screen_keywords = {"screen", "resume", "cv", "parse"}
+        if tokens & screen_keywords and not state.get("resumes"):
+            issues.append(
+                "User requested resume screening but no resumes were produced."
+            )
+            retry_hint = "resume_screening"
 
-    rank_keywords = {"rank", "match", "shortlist", "compare"}
-    if tokens & rank_keywords and not state.get("candidate_rankings"):
-        issues.append(
-            "User requested candidate ranking but no rankings were produced."
-        )
-        retry_hint = "candidate_matching"
+        rank_keywords = {"rank", "match", "shortlist", "compare"}
+        if tokens & rank_keywords and not state.get("candidate_rankings"):
+            issues.append(
+                "User requested candidate ranking but no rankings were produced."
+            )
+            retry_hint = "candidate_matching"
 
-    schedule_keywords = {"schedule", "interview", "slot", "book"}
-    if tokens & schedule_keywords and not state.get("interview_slots"):
-        issues.append(
-            "User requested interview scheduling but no slots were proposed."
-        )
-        retry_hint = "interview_scheduling"
+        schedule_keywords = {"schedule", "interview", "slot", "book"}
+        if tokens & schedule_keywords and not state.get("interview_slots"):
+            issues.append(
+                "User requested interview scheduling but no slots were proposed."
+            )
+            retry_hint = "interview_scheduling"
 
     return _check_result(
         check=CHECK_QUERY,
@@ -351,15 +354,39 @@ def check_all_questions_answered(state: SmartHireState) -> dict:
 # ── Check (d): Clarity and consistency polish ──────────────────────────
 
 
+def _extract_text(content: object) -> str:
+    """Extract plain text from an LLM response content value.
+
+    Gemini may return a list of parts (dicts with 'text'/'signature'/'extras'),
+    a plain string, or an object with a ``.content`` attribute.  This helper
+    normalises all of those to a single trimmed string.
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for p in content:
+            if isinstance(p, dict):
+                t = p.get("text", "")
+            else:
+                t = str(p)
+            if t:
+                parts.append(t)
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
 def improve_clarity_and_consistency(
     state: SmartHireState,
     llm: ChatOllama | None = None,
 ) -> str:
     """Build a coherent final_response from the agent outputs in state.
 
-    If an LLM is provided, use it to polish the combined output into a
-    natural-language summary.  If not (e.g. during testing or when the
-    LLM is unavailable), fall back to a deterministic template.
+    The response is role-aware: candidates receive only their HR answer
+    (never rankings/slot summaries), while recruiters keep the full
+    workflow summary. If an LLM is provided, use it to polish the combined
+    output into a natural-language summary. If not (e.g. during testing or
+    when the LLM is unavailable), fall back to a deterministic template.
 
     Args:
         state: The current shared state with all agent outputs.
@@ -369,37 +396,49 @@ def improve_clarity_and_consistency(
         A polished final_response string.
     """
     parts: list[str] = []
-
-    resumes = state.get("resumes", [])
-    if resumes:
-        names = [r.get("candidate_name", "Unknown") for r in resumes]
-        parts.append(
-            f"Screened {len(resumes)} resume(s): {', '.join(names)}."
-        )
-
-    rankings = state.get("candidate_rankings", [])
-    if rankings:
-        top = rankings[0]
-        parts.append(
-            f"Top candidate: {top.get('candidate_name', 'N/A')} "
-            f"(match score: {top.get('match_score', 'N/A')}%)."
-        )
-        if len(rankings) > 1:
-            others = [r.get("candidate_name", "?") for r in rankings[1:3]]
-            parts.append(f"Also ranked: {', '.join(others)}.")
-
-    slots = state.get("interview_slots", [])
-    if slots:
-        confirmed = sum(1 for s in slots if s.get("status") == "confirmed")
-        parts.append(
-            f"Proposed {len(slots)} interview slot(s), "
-            f"{confirmed} confirmed."
-        )
+    role = state.get("user_role", "recruiter")
 
     hr = state.get("hr_answers", [])
-    if hr:
-        answer = hr[-1].get("answer", "")
-        parts.append(f"HR response: {answer[:300]}")
+    if role == "candidate":
+        # Candidate final response is ONLY the HR answer. Never summarize
+        # resumes, rankings, or interview slots for a candidate.
+        if hr:
+            parts.append(hr[-1].get("answer", ""))
+        else:
+            parts.append(
+                "I'm sorry, I don't have enough information to answer that "
+                "question. Please contact our HR team directly for assistance."
+            )
+    else:
+        resumes = state.get("resumes", [])
+        if resumes:
+            names = [r.get("candidate_name", "Unknown") for r in resumes]
+            parts.append(
+                f"Screened {len(resumes)} resume(s): {', '.join(names)}."
+            )
+
+        rankings = state.get("candidate_rankings", [])
+        if rankings:
+            top = rankings[0]
+            parts.append(
+                f"Top candidate: {top.get('candidate_name', 'N/A')} "
+                f"(match score: {top.get('match_score', 'N/A')}%)."
+            )
+            if len(rankings) > 1:
+                others = [r.get("candidate_name", "?") for r in rankings[1:3]]
+                parts.append(f"Also ranked: {', '.join(others)}.")
+
+        slots = state.get("interview_slots", [])
+        if slots:
+            confirmed = sum(1 for s in slots if s.get("status") == "confirmed")
+            parts.append(
+                f"Proposed {len(slots)} interview slot(s), "
+                f"{confirmed} confirmed."
+            )
+
+        if hr:
+            answer = hr[-1].get("answer", "")
+            parts.append(f"HR response: {answer[:300]}")
 
     fallback_response = " ".join(parts) if parts else "Processing complete."
 
@@ -407,18 +446,24 @@ def improve_clarity_and_consistency(
         try:
             from langchain_core.prompts import ChatPromptTemplate
 
+            audience = (
+                "a job candidate. Keep it concise (2-3 sentences), friendly, "
+                "and focused only on the answer to their question."
+                if role == "candidate"
+                else "a recruiter. Keep it concise (3-5 sentences)."
+            )
             polish_prompt = ChatPromptTemplate.from_messages([
                 ("system", (
                     "You are a recruitment assistant. Rewrite the following "
                     "raw agent outputs into a single, clear, professional "
-                    "summary for a recruiter. Keep it concise (3-5 sentences). "
+                    f"summary for {audience} "
                     "Do not invent information — only rephrase what is given."
                 )),
                 ("human", "{raw_output}"),
             ])
             chain = polish_prompt | llm
             result = chain.invoke({"raw_output": fallback_response})
-            return result.content
+            return _extract_text(result.content)
         except Exception:
             logger.exception("LLM polish failed, using deterministic fallback")
 
@@ -491,7 +536,7 @@ def run_reflection(
     checks.append(check_all_questions_answered(state))
 
     # Check (d): clarity and consistency
-    final_response = improve_clarity_and_consistency(state, llm)
+    final_response = _extract_text(improve_clarity_and_consistency(state, llm))
     clarity_notes = []
     if state.get("resumes") or state.get("candidate_rankings") or state.get(
         "hr_answers"
@@ -582,7 +627,7 @@ def run_reflection(
         "reflection_attempts": attempts + 1,
         "retry_agent": retry_agent,
         "reflection_feedback": feedback,
-        "final_response": final_response,
+        "final_response": _extract_text(final_response),
         # If schedule conflicts were found, update the slots in state.
         **(
             {"interview_slots": cleaned_slots}

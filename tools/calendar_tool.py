@@ -12,12 +12,14 @@ import logging
 from pathlib import Path
 
 from utils.models import InterviewSlot
+from utils.observability import instrument_tool_methods
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_STORE_PATH = "data/interview_slots.json"
 
 
+@instrument_tool_methods
 class CalendarTool:
     """Manages interview calendar operations: availability, conflicts, booking."""
 
