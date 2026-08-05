@@ -239,6 +239,62 @@ class Database:
             "ORDER BY last_active_at DESC, started_at DESC, rowid DESC"
         )
 
+    def replace_session_uploads(self, session_id: str, uploads: list[dict]) -> None:
+        """Replace the original documents retained for one recruiter session."""
+        try:
+            with self.connect() as conn:
+                conn.execute("DELETE FROM session_uploads WHERE session_id = ?", (session_id,))
+                conn.executemany(
+                    """
+                    INSERT INTO session_uploads
+                        (id, session_id, kind, filename, mime_type, content, extracted_text)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            _new_id(),
+                            session_id,
+                            upload["kind"],
+                            upload["filename"],
+                            upload.get("mime_type"),
+                            sqlite3.Binary(upload["content"]),
+                            upload["extracted_text"],
+                        )
+                        for upload in uploads
+                    ],
+                )
+        except (sqlite3.Error, KeyError, TypeError):
+            logger.exception("Failed to save uploads for session %s", session_id)
+
+    def get_session_uploads(self, session_id: str) -> list[sqlite3.Row]:
+        """Return a session's retained documents in their saved order."""
+        return self.fetch_all(
+            "SELECT * FROM session_uploads WHERE session_id = ? ORDER BY created_at, rowid",
+            (session_id,),
+        )
+
+    def delete_session_uploads(self, session_id: str) -> None:
+        """Delete the documents retained for one session."""
+        self.execute("DELETE FROM session_uploads WHERE session_id = ?", (session_id,))
+
+    def delete_session_data(self, session_id: str) -> None:
+        """Delete records that directly belong to one session before its row."""
+        for table in ("session_uploads", "chat_messages", "hr_answers", "interviews"):
+            self.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+
+    def clear_all_hiring_data(self) -> None:
+        """Erase every session and all persisted SmartHire workflow records."""
+        tables = [
+            "session_uploads", "chat_messages", "hr_answers", "interviews",
+            "candidate_rankings", "screenings", "candidates", "job_descriptions", "sessions",
+        ]
+        try:
+            with self.connect() as conn:
+                for table in tables:
+                    conn.execute(f"DELETE FROM {table}")
+        except sqlite3.Error:
+            logger.exception("Failed to clear all SmartHire data")
+
     def update_session_paused(
         self, session_id: str, node_name: str, error_message: str
     ) -> None:

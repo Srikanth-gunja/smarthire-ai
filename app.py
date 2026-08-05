@@ -13,6 +13,7 @@ and a data-driven System Insight tab.
 from __future__ import annotations
 
 import datetime
+import io
 import logging
 import os
 import re
@@ -229,8 +230,8 @@ def _load_past_session(session_id: str) -> None:
     mode = "candidate" if row and row["mode"] == "candidate" else "recruiter"
     st.session_state.chats = _load_all_chats(session_id, audit)
     st.session_state.graph_state = _restore_state(session_id)
-    st.session_state.resume_texts = []
-    st.session_state.jd_data = None
+    _clear_upload_widget_state()
+    _restore_session_uploads(session_id)
     st.session_state.show_results = True
     st.session_state.mode_picker = (
         "Candidate" if mode == "candidate" else "Recruiter"
@@ -243,6 +244,56 @@ def _load_past_session(session_id: str) -> None:
     else:
         st.session_state.pop("paused_at_node", None)
         st.session_state.pop("paused_error", None)
+
+
+def _restore_session_uploads(session_id: str) -> None:
+    """Restore retained source documents so Screening stays usable per session."""
+    resumes: list[dict] = []
+    job_description: dict | None = None
+    for row in Database().get_session_uploads(session_id):
+        record = {
+            "name": row["filename"],
+            "text": row["extracted_text"],
+            "content": bytes(row["content"]),
+            "mime": row["mime_type"] or "application/octet-stream",
+        }
+        if row["kind"] == "resume":
+            resumes.append(record)
+        elif row["kind"] == "job_description":
+            job_description = record
+
+    # Older sessions predate upload retention. Their checkpoint still holds
+    # extracted text, so keep that useful fallback and make it downloadable.
+    if not resumes:
+        resumes = [
+            {
+                "name": item.get("name") or "resume.txt",
+                "text": item.get("text", ""),
+                "content": str(item.get("text", "")).encode("utf-8"),
+                "mime": "text/plain",
+            }
+            for item in st.session_state.graph_state.get("resume_inputs", [])
+            if item.get("text")
+        ]
+    if job_description is None:
+        raw_text = st.session_state.graph_state.get("job_description", {}).get("raw_text", "")
+        if raw_text:
+            job_description = {
+                "name": "job-description.txt",
+                "text": raw_text,
+                "content": raw_text.encode("utf-8"),
+                "mime": "text/plain",
+            }
+    st.session_state.resume_texts = resumes
+    st.session_state.jd_data = job_description
+    st.session_state.pop("jd_paste_text", None)
+
+
+def _clear_upload_widget_state() -> None:
+    """Remove browser widget values before switching the underlying session."""
+    for key in list(st.session_state):
+        if key in {"resume_uploader", "jd_uploader", "jd_source", "jd_paste_text", "jd_text_preview"} or key.startswith("resume_preview_"):
+            st.session_state.pop(key, None)
 
 
 def _load_all_chats(session_id: str, audit: ChatAudit) -> dict[str, list[dict]]:
@@ -271,7 +322,9 @@ def _reset_current_session() -> None:
     mode = "candidate" if st.session_state.mode_picker == "Candidate" else "recruiter"
     ConversationMemory().reset_session(session_id, mode)
     audit.clear(session_id)
+    Database().delete_session_uploads(session_id)
     Database().clear_session_paused(session_id)
+    _clear_upload_widget_state()
     st.session_state.chats = {"candidate": [], "recruiter": []}
     st.session_state.graph_state = SmartHireState(conversation_history=[])
     st.session_state.resume_texts = []
@@ -284,6 +337,14 @@ def _reset_current_session() -> None:
     audit.save_session_id(session_id)
 
 
+def _clear_all_sessions() -> None:
+    """Remove every saved session, upload, workflow result, and chat record."""
+    ChatAudit().clear_session_id()
+    ConversationMemory().clear_all_sessions()
+    _start_new_session()
+    st.session_state.flash = "All saved sessions and their uploaded files were cleared."
+
+
 def _start_new_session() -> None:
     """Create an explicitly requested blank session and switch to it."""
     audit = ChatAudit()
@@ -291,6 +352,7 @@ def _start_new_session() -> None:
     session_id = ConversationMemory().create_session(mode)
     st.session_state.session_id = session_id
     audit.save_session_id(session_id)
+    _clear_upload_widget_state()
     st.session_state.chats = {"candidate": [], "recruiter": []}
     st.session_state.graph_state = SmartHireState(conversation_history=[])
     st.session_state.resume_texts = []
@@ -320,7 +382,7 @@ if "chats" not in st.session_state:
         st.session_state.session_id, ChatAudit()
     )
 if "resume_texts" not in st.session_state:
-    st.session_state.resume_texts = []
+    _restore_session_uploads(st.session_state.session_id)
 if "jd_data" not in st.session_state:
     st.session_state.jd_data = None
 if "show_results" not in st.session_state:
@@ -376,6 +438,25 @@ def _extract_docx_text(uploaded_file) -> str:
 
     document = Document(uploaded_file)
     return "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+
+def _read_uploaded_document(uploaded_file) -> dict:
+    """Keep the original bytes and extract text once for workflow/session use."""
+    content = uploaded_file.getvalue()
+    filename = uploaded_file.name
+    stream = io.BytesIO(content)
+    if filename.lower().endswith(".pdf"):
+        text = _extract_pdf_text(stream)
+    elif filename.lower().endswith(".docx"):
+        text = _extract_docx_text(stream)
+    else:
+        text = content.decode("utf-8")
+    return {
+        "name": filename,
+        "text": text,
+        "content": content,
+        "mime": uploaded_file.type or "application/octet-stream",
+    }
 
 
 def _iter_pipeline(user_input: str):
@@ -1394,21 +1475,23 @@ def _render_upload_tab() -> None:
             label_visibility="collapsed",
         )
         if uploaded_resumes:
-            st.session_state.resume_texts = []
-            for f in uploaded_resumes:
-                text = (
-                    _extract_pdf_text(f)
-                    if f.type == "application/pdf"
-                    else f.read().decode("utf-8") if f.name.lower().endswith(".txt")
-                    else _extract_docx_text(f)
-                )
-                st.session_state.resume_texts.append({"name": f.name, "text": text})
+            st.session_state.resume_texts = [
+                _read_uploaded_document(uploaded_file)
+                for uploaded_file in uploaded_resumes
+            ]
             st.success(f"Loaded {len(st.session_state.resume_texts)} resume(s)")
         if st.session_state.resume_texts:
             with st.expander("Review extracted resume text"):
                 for r in st.session_state.resume_texts:
                     st.markdown(f"**{r['name']}**")
                     st.caption(f"{len(r['text']):,} characters extracted")
+                    st.download_button(
+                        "Download original",
+                        data=r.get("content") or r["text"].encode("utf-8"),
+                        file_name=r["name"],
+                        mime=r.get("mime", "text/plain"),
+                        key=f"resume_download_{r['name']}",
+                    )
                     st.text_area(
                         "Extracted text",
                         value=r["text"],
@@ -1437,7 +1520,9 @@ def _render_upload_tab() -> None:
             key="jd_source",
         )
 
-        jd_text = ""
+        stored_jd = st.session_state.jd_data or {}
+        jd_record = dict(stored_jd) if stored_jd else None
+        jd_text = stored_jd.get("text", "")
         if jd_option == "Upload file":
             jd_file = st.file_uploader(
                 "JD file",
@@ -1446,28 +1531,46 @@ def _render_upload_tab() -> None:
                 label_visibility="collapsed",
             )
             if jd_file:
-                jd_text = (
-                    _extract_pdf_text(jd_file)
-                    if jd_file.type == "application/pdf"
-                    else jd_file.read().decode("utf-8") if jd_file.name.lower().endswith(".txt")
-                    else _extract_docx_text(jd_file)
-                )
+                jd_record = _read_uploaded_document(jd_file)
+                jd_text = jd_record["text"]
         elif jd_option == "Paste text":
             jd_text = st.text_area(
                 "Paste job description",
                 height=160,
+                value=stored_jd.get("text", ""),
+                key="jd_paste_text",
                 placeholder="Paste the full job description here…",
                 label_visibility="collapsed",
             )
+            jd_record = {
+                "name": "job-description.txt",
+                "text": jd_text,
+                "content": jd_text.encode("utf-8"),
+                "mime": "text/plain",
+            }
         else:
             jd_file = Path("data/sample_jd.txt")
             if jd_file.exists():
                 jd_text = jd_file.read_text(encoding="utf-8")
+                jd_record = {
+                    "name": jd_file.name,
+                    "text": jd_text,
+                    "content": jd_text.encode("utf-8"),
+                    "mime": "text/plain",
+                }
                 st.info("Using sample JD: Senior Full-Stack Developer")
 
         if jd_text:
             with st.expander("Review extracted job description text"):
                 st.caption(f"{len(jd_text):,} characters extracted")
+                if jd_record:
+                    st.download_button(
+                        "Download job description",
+                        data=jd_record.get("content") or jd_text.encode("utf-8"),
+                        file_name=jd_record.get("name", "job-description.txt"),
+                        mime=jd_record.get("mime", "text/plain"),
+                        key="jd_download",
+                    )
                 st.text_area(
                     "Extracted job description",
                     value=jd_text,
@@ -1512,6 +1615,28 @@ def _render_upload_tab() -> None:
             jd_id = Database().persist_job_description(
                 {}, raw_text=jd_text, source=jd_source
             )
+            uploads = [
+                {
+                    "kind": "resume",
+                    "filename": resume["name"],
+                    "mime_type": resume.get("mime"),
+                    "content": resume.get("content") or resume["text"].encode("utf-8"),
+                    "extracted_text": resume["text"],
+                }
+                for resume in st.session_state.resume_texts
+            ]
+            if jd_record:
+                uploads.append(
+                    {
+                        "kind": "job_description",
+                        "filename": jd_record.get("name", "job-description.txt"),
+                        "mime_type": jd_record.get("mime", "text/plain"),
+                        "content": jd_record.get("content") or jd_text.encode("utf-8"),
+                        "extracted_text": jd_text,
+                    }
+                )
+            Database().replace_session_uploads(st.session_state.session_id, uploads)
+            st.session_state.jd_data = jd_record
             st.session_state.graph_state = {
                 **st.session_state.graph_state,
                 "user_role": "recruiter",
@@ -1726,6 +1851,10 @@ with st.sidebar:
 
     if st.button("Clear Current Session", type="secondary", use_container_width=True):
         _reset_current_session()
+        st.rerun()
+
+    if st.button("Clear All Sessions", type="secondary", use_container_width=True):
+        _clear_all_sessions()
         st.rerun()
 
 

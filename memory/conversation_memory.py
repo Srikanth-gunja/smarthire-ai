@@ -245,8 +245,21 @@ class ConversationMemory:
             self._saver.delete_thread(session_id)
         except Exception:
             logger.exception("Failed to clear checkpoints for session %s", session_id)
+        self.db.delete_session_data(session_id)
         self.db.delete_session(session_id)
         logger.info("Cleared session %s", session_id)
+
+    def clear_all_sessions(self) -> None:
+        """Erase checkpoints and persisted data for every SmartHire session."""
+        session_ids = [row["id"] for row in self.db.get_sessions()]
+        for session_id in session_ids:
+            self._sessions.pop(session_id, None)
+            try:
+                self._saver.delete_thread(session_id)
+            except Exception:
+                logger.exception("Failed to clear checkpoints for session %s", session_id)
+        self.db.clear_all_hiring_data()
+        logger.info("Cleared all SmartHire sessions: count=%d", len(session_ids))
 
     def reset_session(self, session_id: str, mode: str | None = None) -> None:
         """Clear a session's working data while retaining its identity.

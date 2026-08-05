@@ -110,3 +110,18 @@ CREATE INDEX IF NOT EXISTS idx_interviews_jd ON interviews(jd_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_mode ON chat_messages(session_id, mode, created_at);
+
+-- Original recruiter uploads, retained per session so the Screening tab can
+-- restore and download exactly the documents used in that workflow.
+CREATE TABLE IF NOT EXISTS session_uploads (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    kind TEXT NOT NULL,             -- 'resume' | 'job_description'
+    filename TEXT NOT NULL,
+    mime_type TEXT,
+    content BLOB NOT NULL,
+    extracted_text TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_uploads_session ON session_uploads(session_id, kind, created_at);
