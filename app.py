@@ -1355,37 +1355,17 @@ def _render_scheduling_tab() -> None:
 # ── System Insight ────────────────────────────────────────────────────
 
 
-def _routing_log(limit: int = 10) -> list[str]:
-    lines = []
-    for msg in st.session_state.graph_state.get("conversation_history", []):
-        content = getattr(msg, "content", "")
-        if isinstance(content, str) and content.startswith("[Supervisor]"):
-            lines.append(content)
-    return lines[-limit:]
+def _pipeline_rankings() -> list[dict]:
+    """Ranked candidates sorted by rank for the pipeline overview."""
+    rankings = st.session_state.graph_state.get("candidate_rankings", [])
 
+    def _rank_key(c):
+        try:
+            return int(c.get("rank", 999))
+        except (TypeError, ValueError):
+            return 999
 
-def _jd_chart(rankings: list) -> plt.Figure | None:
-    job_description = st.session_state.graph_state.get("job_description", {})
-    active_title = (
-        job_description.get("job_title")
-        or job_description.get("title")
-        or "Current job description"
-    )
-    counts = Counter(r.get("jd_title") or active_title for r in rankings)
-    if not counts:
-        return None
-    titles = list(counts.keys())
-    values = [counts[t] for t in titles]
-    fig, ax = plt.subplots(figsize=(8, max(2.2, 0.5 * len(titles))))
-    bars = ax.barh(titles, values, color=_PRIMARY)
-    ax.set_xlabel("Candidates")
-    ax.set_title("Candidates in this session")
-    ax.invert_yaxis()
-    for bar, value in zip(bars, values):
-        ax.text(bar.get_width() + 0.05, bar.get_y() + bar.get_height() / 2,
-                str(value), va="center")
-    plt.tight_layout()
-    return fig
+    return sorted(rankings, key=_rank_key)
 
 
 def _render_insight_tab() -> None:
@@ -1419,34 +1399,70 @@ def _render_insight_tab() -> None:
 
     st.divider()
 
-    with st.expander("Candidates in this session (chart)", expanded=True):
-        chart = _jd_chart(rankings)
-        if chart is None:
+    job_description = state.get("job_description") or {}
+    jd_title = (
+        job_description.get("job_title")
+        or job_description.get("title")
+        or None
+    )
+
+    with st.expander("Pipeline overview", expanded=True):
+        if not rankings:
             _empty_state(
-                "📊",
-                "No session ranking data yet",
-                "Run Screen & Rank Candidates in this session to populate the chart.",
+                "🧭",
+                "No candidates ranked yet",
+                "Run Screen & Rank Candidates in this session to see the "
+                "pipeline breakdown.",
             )
         else:
-            st.pyplot(chart)
+            if jd_title:
+                st.markdown(f"**Role:** {jd_title}")
+            st.markdown(
+                f"**{len(rankings)} ranked candidate(s)** — best fit to this "
+                "job description, with their interview status."
+            )
+            schedule_map = {
+                s.get("candidate_name"): s
+                for s in interviews
+            }
+            for c in _pipeline_rankings():
+                name = c.get("candidate_name", "Unknown")
+                score = c.get("match_score")
+                score_str = f"{score:.0f}%" if isinstance(score, (int, float)) else "—"
+                status_line = f"**#{c.get('rank', '?')}** {name} — {score_str} match"
+                slot = schedule_map.get(name)
+                if slot:
+                    window = (
+                        f"{slot.get('date', '?')} "
+                        f"{slot.get('time_start', '')}-{slot.get('time_end', '')}"
+                    )
+                    status_line += f" · Interview: {window} · {slot.get('status', 'proposed')}"
+                else:
+                    status_line += " · Waiting on interview"
+                st.markdown(status_line)
+                justification = (c.get("justification") or "").strip()
+                if justification:
+                    st.caption(justification)
 
-    with st.expander("Agent Routing Log (last 10 decisions)", expanded=False):
-        log_lines = _routing_log()
-        if log_lines:
-            st.code("\n".join(log_lines))
-        else:
+    with st.expander("Skills demand vs. supply", expanded=False):
+        screened = resumes or []
+        if not screened:
             st.caption(
-                "No routing decisions yet — the Supervisor's intent + routing "
-                "choices appear here after you chat or screen candidates."
+                "Skills analysis appears once resumes are screened in this session."
             )
-
-    with st.expander("Raw conversation history", expanded=False):
-        history = st.session_state.graph_state.get("conversation_history", [])
-        if history:
-            for msg in history:
-                st.write(f"**{type(msg).__name__}**: {str(msg.content)[:220]}")
         else:
-            st.caption("No conversation yet.")
+            skills_counter = Counter()
+            for r in screened:
+                for skill in r.get("skills") or []:
+                    skills_counter[re.sub(r"\s+", " ", str(skill).strip())] += 1
+            if not skills_counter:
+                st.caption("No skills were extracted from the screened resumes.")
+            else:
+                st.markdown("**Most common skills in this session's candidate pool:**")
+                rank = 1
+                for skill, count in skills_counter.most_common(10):
+                    st.markdown(f"{rank}. **{skill}** — {count} candidate(s)")
+                    rank += 1
 
 
 # ── Upload & Screen tab ───────────────────────────────────────────────
