@@ -40,7 +40,9 @@ class InterviewSchedulerAgent:
         self.calendar = calendar or CalendarTool()
 
     def propose_schedule(
-        self, input_data: InterviewSchedulingInput
+        self,
+        input_data: InterviewSchedulingInput,
+        session_id: str | None = None,
     ) -> InterviewSchedulingOutput:
         """Propose interview slots for the given candidates.
 
@@ -49,6 +51,8 @@ class InterviewSchedulerAgent:
 
         Args:
             input_data: Candidates, availability, and interviewer preferences.
+            session_id: Optional session identifier for filtering interviews
+                in the Session Interviews tab.
 
         Returns:
             Proposed slots with any conflicts identified.
@@ -148,6 +152,9 @@ class InterviewSchedulerAgent:
                     proposed_start=proposed_start,
                     proposed_end=proposed_end,
                     status=slot.status,
+                    session_id=session_id,
+                    interview_type=slot.interview_type,
+                    interviewer=slot.interviewer,
                 )
         except Exception:
             logger.exception("Failed to persist interview scheduling result")

@@ -342,7 +342,9 @@ def build_graph(
             availability=availability,
             reflection_feedback=state.get("reflection_feedback"),
         )
-        result = interview_scheduler_agent.propose_schedule(input_data)
+        result = interview_scheduler_agent.propose_schedule(
+            input_data, session_id=session_id
+        )
 
         remaining = state.get("active_agents", [])[1:]
         logger.info("InterviewScheduling completed: %s", result.summary)

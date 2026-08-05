@@ -16,7 +16,7 @@ import datetime
 import logging
 import os
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import matplotlib
@@ -907,6 +907,9 @@ def _confirm_slot(slot: dict, candidate: str, idx: int) -> None:
         proposed_start=f"{slot['date']} {slot['time_start']}:00",
         proposed_end=f"{slot['date']} {slot['time_end']}:00",
         status="confirmed",
+        session_id=st.session_state.session_id,
+        interview_type=slot.get("interview_type"),
+        interviewer=slot.get("interviewer"),
     )
     sched = st.session_state.sched
     sched["slots"][idx]["confirmed"] = True
@@ -918,88 +921,194 @@ def _confirm_slot(slot: dict, candidate: str, idx: int) -> None:
     st.rerun()
 
 
-def _render_scheduling_tab() -> None:
-    st.markdown("### 📅 Interview Scheduling")
-    st.caption(
-        "Pick a shortlisted candidate and confirm a slot. Grayed slots conflict "
-        "with the interviewer's calendar and are disabled."
-    )
-
-    candidates = _candidate_options()
-    if not candidates:
+def _render_session_interviews() -> None:
+    """Render the list of interviews scheduled in the current session."""
+    session_id = st.session_state.get("session_id", "")
+    if not session_id:
         _empty_state(
-            "🗓️",
-            "No candidates to schedule",
-            "Screen and rank resumes first, then return here to book interviews.",
+            "📋",
+            "No active session",
+            "Start a session to see scheduled interviews here.",
         )
         return
 
-    default_idx = 0
-    preselected = st.session_state.pop("schedule_candidate", None)
-    if preselected in candidates:
-        default_idx = candidates.index(preselected)
+    db = Database()
+    rows = db.get_interviews_by_session(session_id)
 
-    col_c, col_i, col_d = st.columns([2, 2, 2])
-    with col_c:
-        candidate = st.selectbox(
-            "Shortlisted candidate", candidates, index=default_idx
+    if not rows:
+        _empty_state(
+            "📋",
+            "No interviews scheduled yet",
+            "Go to 'Schedule New' to propose slots for a shortlisted candidate.",
         )
-    with col_i:
-        interviewer = st.selectbox(
-            "Interviewer", ["Bob Tech Lead", "Alice Manager", "Carol Director"]
-        )
-    with col_d:
-        date = st.date_input(
-            "Interview date",
-            value=datetime.datetime.now(datetime.UTC).date(),
-        ).isoformat()
+        return
 
-    if st.button("Propose available slots", type="primary", use_container_width=True):
-        st.session_state.sched = {
-            "candidate": candidate,
-            "interviewer": interviewer,
-            "date": date,
-            "slots": _propose_slots(candidate, date, interviewer),
-        }
+    # Group by date
+    by_date: dict[str, list] = defaultdict(list)
+    for row in rows:
+        start = row["proposed_start"] or ""
+        date_str = start[:10] if len(start) >= 10 else "Unknown"
+        by_date[date_str].append(row)
 
-    sched = st.session_state.get("sched")
-    if sched and sched["candidate"] == candidate and sched["interviewer"] == interviewer:
-        st.divider()
-        st.markdown(
-            f"**{sched['candidate']}** with {sched['interviewer']} on {sched['date']}"
-        )
-        columns = st.columns(3)
-        for idx, slot in enumerate(sched["slots"]):
-            with columns[idx % 3]:
-                if slot["conflict"]:
-                    with st.container(border=True):
-                        st.markdown(
-                            f"<div style='opacity:.55'>⛔ **{slot['time_start']}–{slot['time_end']}**"
-                            f"<br><small>{slot['interview_type']} · {slot['interviewer']}</small>"
-                            f"<br><span style='color:#B91C1C'>Conflict</span></div>",
-                            unsafe_allow_html=True,
-                        )
-                elif slot["confirmed"]:
-                    with st.container(border=True):
-                        st.markdown(
-                            f"✅ **{slot['time_start']}–{slot['time_end']}**"
-                            f"<br><small>{slot['interview_type']} · {slot['interviewer']}</small>"
-                            f"<br><span style='color:{_PRIMARY};font-weight:600'>Confirmed</span>",
-                            unsafe_allow_html=True,
-                        )
-                else:
-                    with st.container(border=True):
-                        st.markdown(
-                            f"**{slot['time_start']}–{slot['time_end']}**"
-                            f"<br><small>{slot['interview_type']} · {slot['interviewer']}</small>",
-                            unsafe_allow_html=True,
-                        )
+    # Sort dates soonest first
+    sorted_dates = sorted(by_date.keys())
+
+    for date_str in sorted_dates:
+        if len(sorted_dates) > 1:
+            st.markdown(f"**{date_str}**")
+
+        for row in by_date[date_str]:
+            interview_id = row["id"]
+            candidate = row["candidate_name"] or "Unknown"
+            interviewer_val = row["interviewer"] or "—"
+            interview_type = row["interview_type"] or "—"
+            status = row["status"] or "proposed"
+
+            start = row["proposed_start"] or ""
+            end = row["proposed_end"] or ""
+            time_display = f"{start[11:16]}–{end[11:16]}" if len(start) > 11 and len(end) > 11 else "—"
+
+            # Status badge colours
+            if status == "confirmed":
+                badge = (
+                    "<span style='color:#15803d;font-weight:600'>"
+                    "● Confirmed</span>"
+                )
+            elif status == "cancelled":
+                badge = (
+                    "<span style='color:#B91C1C;font-weight:600'>"
+                    "● Cancelled</span>"
+                )
+            else:
+                badge = (
+                    "<span style='color:#A16207;font-weight:600'>"
+                    "● Proposed</span>"
+                )
+
+            with st.container(border=True):
+                cols = st.columns([5, 1])
+                with cols[0]:
+                    st.markdown(
+                        f"**{candidate}** · {interview_type}<br>"
+                        f"<small>{interviewer_val} · {time_display}</small><br>"
+                        f"{badge}",
+                        unsafe_allow_html=True,
+                    )
+                with cols[1]:
+                    if status in ("confirmed", "proposed"):
                         if st.button(
-                            "Confirm interview",
-                            key=f"confirm_slot_{idx}",
+                            "Cancel",
+                            key=f"cancel_interview_{interview_id}",
                             use_container_width=True,
                         ):
-                            _confirm_slot(slot, candidate, idx)
+                            db.update_interview_status(interview_id, "cancelled")
+                            st.rerun()
+
+
+def _render_scheduling_tab() -> None:
+    st.markdown("### 📅 Interview Scheduling")
+
+    tab_new, tab_session = st.tabs(["Schedule New", "Session Interviews"])
+
+    with tab_new:
+        st.caption(
+            "Pick a shortlisted candidate and confirm a slot. Grayed slots "
+            "conflict with the interviewer's calendar and are disabled."
+        )
+
+        candidates = _candidate_options()
+        if not candidates:
+            _empty_state(
+                "🗓️",
+                "No candidates to schedule",
+                "Screen and rank resumes first, then return here to book interviews.",
+            )
+        else:
+            default_idx = 0
+            preselected = st.session_state.pop("schedule_candidate", None)
+            if preselected in candidates:
+                default_idx = candidates.index(preselected)
+
+            col_c, col_i, col_d = st.columns([2, 2, 2])
+            with col_c:
+                candidate = st.selectbox(
+                    "Shortlisted candidate", candidates, index=default_idx
+                )
+            with col_i:
+                interviewer = st.selectbox(
+                    "Interviewer",
+                    ["Bob Tech Lead", "Alice Manager", "Carol Director"],
+                )
+            with col_d:
+                date = st.date_input(
+                    "Interview date",
+                    value=datetime.datetime.now(datetime.UTC).date(),
+                ).isoformat()
+
+            if st.button(
+                "Propose available slots",
+                type="primary",
+                use_container_width=True,
+            ):
+                st.session_state.sched = {
+                    "candidate": candidate,
+                    "interviewer": interviewer,
+                    "date": date,
+                    "slots": _propose_slots(candidate, date, interviewer),
+                }
+
+            sched = st.session_state.get("sched")
+            if (
+                sched
+                and sched["candidate"] == candidate
+                and sched["interviewer"] == interviewer
+            ):
+                st.divider()
+                st.markdown(
+                    f"**{sched['candidate']}** with {sched['interviewer']} "
+                    f"on {sched['date']}"
+                )
+                columns = st.columns(3)
+                for idx, slot in enumerate(sched["slots"]):
+                    with columns[idx % 3]:
+                        if slot["conflict"]:
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"<div style='opacity:.55'>"
+                                    f"⛔ **{slot['time_start']}–{slot['time_end']}**"
+                                    f"<br><small>{slot['interview_type']} · "
+                                    f"{slot['interviewer']}</small>"
+                                    f"<br><span style='color:#B91C1C'>Conflict</span>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                        elif slot["confirmed"]:
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"✅ **{slot['time_start']}–{slot['time_end']}**"
+                                    f"<br><small>{slot['interview_type']} · "
+                                    f"{slot['interviewer']}</small>"
+                                    f"<br><span style='color:{_PRIMARY};"
+                                    f"font-weight:600'>Confirmed</span>",
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"**{slot['time_start']}–{slot['time_end']}**"
+                                    f"<br><small>{slot['interview_type']} · "
+                                    f"{slot['interviewer']}</small>",
+                                    unsafe_allow_html=True,
+                                )
+                                if st.button(
+                                    "Confirm interview",
+                                    key=f"confirm_slot_{idx}",
+                                    use_container_width=True,
+                                ):
+                                    _confirm_slot(slot, candidate, idx)
+
+    with tab_session:
+        _render_session_interviews()
 
 
 # ── System Insight ────────────────────────────────────────────────────
@@ -1264,17 +1373,9 @@ def _render_upload_tab() -> None:
                 f"RESUMES:\n{resume_blocks}\n\n"
                 "Please screen these resumes against the JD and rank them."
             )
-            prior_count = len(
-                st.session_state.graph_state.get("conversation_history", [])
-            )
             st.session_state.pending_input = combined
             st.session_state.last_user_input = combined
             _run_with_progress("Running multi-agent pipeline…")
-            ChatAudit().log_turn(
-                st.session_state.session_id,
-                result=st.session_state.graph_state,
-                prior_history_count=prior_count,
-            )
             st.session_state.show_results = True
 
     if st.session_state.get("show_results"):

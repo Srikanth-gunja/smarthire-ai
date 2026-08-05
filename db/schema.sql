@@ -55,11 +55,16 @@ CREATE TABLE IF NOT EXISTS interviews (
     id TEXT PRIMARY KEY,
     candidate_id TEXT REFERENCES candidates(id),
     jd_id TEXT REFERENCES job_descriptions(id),
+    session_id TEXT,
     proposed_start TIMESTAMP,
     proposed_end TIMESTAMP,
+    interview_type TEXT DEFAULT 'technical',
+    interviewer TEXT,
     status TEXT DEFAULT 'proposed',  -- proposed | confirmed | cancelled
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_interviews_session ON interviews(session_id);
 
 -- Sessions (maps a Streamlit session to a LangGraph thread_id)
 CREATE TABLE IF NOT EXISTS sessions (

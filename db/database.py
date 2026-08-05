@@ -77,20 +77,52 @@ class Database:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(str(self.db_path), timeout=30) as conn:
-            conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-            # Migration: add columns to existing sessions table if missing
+            # Run migrations first so new columns exist before any indexes
+            # in schema.sql that reference them.
             self._migrate_sessions(conn)
+            self._migrate_interviews(conn)
+            conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         self._schema_ready = True
 
     @staticmethod
     def _migrate_sessions(conn: sqlite3.Connection) -> None:
         """Add new columns to the sessions table for existing databases."""
-        cursor = conn.execute("PRAGMA table_info(sessions)")
-        existing = {row[1] for row in cursor.fetchall()}
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'"
+            )
+            if not cursor.fetchone():
+                return  # table doesn't exist yet; schema.sql will create it
+            cursor = conn.execute("PRAGMA table_info(sessions)")
+            existing = {row[1] for row in cursor.fetchall()}
+        except Exception:
+            return
         if "paused_at_node" not in existing:
             conn.execute("ALTER TABLE sessions ADD COLUMN paused_at_node TEXT")
         if "error_message" not in existing:
             conn.execute("ALTER TABLE sessions ADD COLUMN error_message TEXT")
+
+    @staticmethod
+    def _migrate_interviews(conn: sqlite3.Connection) -> None:
+        """Add new columns to the interviews table for existing databases."""
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='interviews'"
+            )
+            if not cursor.fetchone():
+                return  # table doesn't exist yet; schema.sql will create it
+            cursor = conn.execute("PRAGMA table_info(interviews)")
+            existing = {row[1] for row in cursor.fetchall()}
+        except Exception:
+            return
+        if "session_id" not in existing:
+            conn.execute("ALTER TABLE interviews ADD COLUMN session_id TEXT")
+        if "interview_type" not in existing:
+            conn.execute(
+                "ALTER TABLE interviews ADD COLUMN interview_type TEXT DEFAULT 'technical'"
+            )
+        if "interviewer" not in existing:
+            conn.execute("ALTER TABLE interviews ADD COLUMN interviewer TEXT")
 
     # ── Connections ────────────────────────────────────────────────────
 
@@ -434,6 +466,9 @@ class Database:
         proposed_start: str | None = None,
         proposed_end: str | None = None,
         status: str = "proposed",
+        session_id: str | None = None,
+        interview_type: str | None = None,
+        interviewer: str | None = None,
     ) -> str | None:
         """Persist one Interview Scheduling Agent output row."""
         if status not in INTERVIEW_STATUSES:
@@ -442,10 +477,14 @@ class Database:
         self.execute(
             """
             INSERT INTO interviews
-                (id, candidate_id, jd_id, proposed_start, proposed_end, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (id, candidate_id, jd_id, session_id, proposed_start, proposed_end,
+                 interview_type, interviewer, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (interview_id, candidate_id, jd_id, proposed_start, proposed_end, status),
+            (
+                interview_id, candidate_id, jd_id, session_id,
+                proposed_start, proposed_end, interview_type, interviewer, status,
+            ),
         )
         return interview_id
 
@@ -460,6 +499,30 @@ class Database:
             ORDER BY i.created_at DESC
             """
         )
+
+    def get_interviews_by_session(self, session_id: str) -> list[sqlite3.Row]:
+        """Return interview rows for a specific session, soonest first."""
+        return self.fetch_all(
+            """
+            SELECT i.*, c.name AS candidate_name, jd.title AS jd_title
+            FROM interviews i
+            LEFT JOIN candidates c ON c.id = i.candidate_id
+            LEFT JOIN job_descriptions jd ON jd.id = i.jd_id
+            WHERE i.session_id = ?
+            ORDER BY i.proposed_start ASC
+            """,
+            (session_id,),
+        )
+
+    def update_interview_status(self, interview_id: str, status: str) -> bool:
+        """Update the status of an interview. Returns True if a row was changed."""
+        if status not in INTERVIEW_STATUSES:
+            return False
+        cursor = self.execute(
+            "UPDATE interviews SET status = ? WHERE id = ?",
+            (status, interview_id),
+        )
+        return cursor.rowcount > 0
 
     # ── HR answers ─────────────────────────────────────────────────────
 
