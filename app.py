@@ -1186,6 +1186,7 @@ def _propose_slots(candidate: str, date: str, interviewer: str) -> list[dict]:
     slot conflicts only when it overlaps an existing booking.
     """
     calendar = CalendarTool()
+    calendar.purge_past_bookings()
     hours = [
         ("09:00", "10:00"),
         ("10:00", "11:00"),
