@@ -22,7 +22,6 @@ SmartHire AI orchestrates a team of specialized AI agents to automate the end-to
 - [Frontend](#frontend)
 - [Testing](#testing)
 - [Development](#development)
-- [Git History](#git-history)
 
 ---
 
@@ -677,26 +676,3 @@ Runs a full pipeline with a sample HR question against the real LLM.
 - Models: Pydantic v2 with explicit field descriptions
 - No comments unless requested
 
----
-
-## Git History
-
-| Commit | Description |
-|--------|-------------|
-| `04d6205` | Initial commit — full multi-agent recruitment system |
-| `90ec314` | Bug fix — resume parsing now uses grounded skills from parser instead of LLM-only extraction, fixing duplicate top-4 skills across candidates |
-
-### Bug Fix Details
-
-The `90ec314` commit fixed an issue where the Resume Screening Agent relied solely on the LLM's structured output for skill extraction. Small local models (e.g., Llama 3.2) would often return the same generic 4 skills for every resume regardless of content. The fix:
-
-1. Uses the parser's extracted skills (`parsed.get("skills", [])`) instead of `result.skills`
-2. Supplements with text-level vocabulary scan via `skill_normalizer.extract_skills_from_text()`
-3. Computes match score deterministically from grounded skills instead of LLM output
-4. Falls back to LLM values only when parser extraction fails
-
----
-
-## License
-
-Internal project — not currently licensed for public distribution.
