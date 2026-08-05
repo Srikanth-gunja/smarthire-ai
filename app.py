@@ -763,7 +763,6 @@ def _render_screening_live(placeholder, entries: list[dict], total: int) -> None
     placeholder.empty()
     done = len(entries)
     with placeholder.container():
-        st.markdown(f"**Screening {done} of {total} resumes…**")
         names: list[str] = []
         for entry in entries:
             if entry.get("screening_status") == "failed":
