@@ -91,6 +91,17 @@ class ResumeParser:
         )
         return extracted
 
+    async def parse_text_async(self, resume_text: str) -> dict:
+        """Async equivalent of :meth:`parse_text` for concurrent screening."""
+        structured_llm = self.llm.with_structured_output(ExtractedResume)
+        chain = EXTRACTION_PROMPT | structured_llm
+        result = await chain.ainvoke({"resume_text": resume_text})
+        extracted = result.model_dump()
+        extracted["skills"] = normalize_skill_list(
+            extracted["skills"] + extract_skills_from_text(resume_text)
+        )
+        return extracted
+
     def parse_file(self, file_path: str) -> dict:
         """Parse a resume file and return structured data.
 

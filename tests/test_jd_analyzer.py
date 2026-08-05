@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -97,6 +98,36 @@ class TestAnalyze:
 
         assert "Python" in result["required_skills"]
         assert "Kubernetes" in result["preferred_skills"]
+
+    def test_analyze_async_uses_ainvoke(self, analyzer, mock_llm, sample_jd_text):
+        """analyze_async returns the same dict via non-blocking LLM calls."""
+        mock_result = ExtractedJD(
+            job_title="Senior Developer",
+            required_skills=["Python", "React"],
+            preferred_skills=["Kubernetes"],
+            min_experience_years=5,
+            max_experience_years=None,
+            education_requirements={"degree_level": "Bachelor"},
+            summary="Role summary.",
+        )
+        mock_structured = MagicMock()
+        mock_structured.ainvoke = AsyncMock(return_value=mock_result)
+        mock_structured.return_value = mock_result
+        mock_llm.with_structured_output.return_value = mock_structured
+
+        with patch("tools.jd_analyzer.ChatPromptTemplate") as mock_prompt_cls:
+            mock_prompt = MagicMock()
+            mock_chain = MagicMock()
+            mock_chain.ainvoke = AsyncMock(return_value=mock_result)
+            mock_prompt.__or__ = MagicMock(return_value=mock_chain)
+            mock_prompt_cls.from_messages.return_value = mock_prompt
+
+            result = asyncio.run(analyzer.analyze_async(sample_jd_text))
+
+        assert isinstance(result, dict)
+        assert "Python" in result["required_skills"]
+        assert "Kubernetes" in result["preferred_skills"]
+        assert result["job_title"] == "Senior Developer"
 
 
 class TestAnalyzeFile:

@@ -7,7 +7,9 @@ Does NOT rank candidates across each other (that's Candidate Matching).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -137,6 +139,145 @@ class ResumeScreeningAgent:
             logger.exception("Failed to persist resume screening result")
 
         return output
+
+    async def screen_resume_async(
+        self, input_data: ResumeScreeningInput, resume_filename: str | None = None
+    ) -> ResumeScreeningOutput:
+        """Screen one resume with non-blocking LLM calls and persist its result."""
+        parsed = await self.parser.parse_text_async(input_data.resume_text)
+        return await self.screen_parsed_async(
+            parsed, input_data.resume_text, input_data.job_description, resume_filename
+        )
+
+    async def screen_parsed_async(
+        self,
+        parsed: dict,
+        resume_text: str,
+        jd_data: dict,
+        resume_filename: str | None = None,
+    ) -> ResumeScreeningOutput:
+        """Score an already-parsed resume against the JD and persist the result.
+
+        Split out of :meth:`screen_resume_async` so the batch fan-out can parse
+        every resume concurrently (parsing is JD-independent) and only score
+        each one once both its parse and the shared JD analysis task have
+        landed — the JD and the resumes are analyzed in parallel.
+        """
+        structured_llm = self.llm.with_structured_output(ScreeningResult)
+        chain = SCREENING_PROMPT | structured_llm
+        result = await chain.ainvoke({
+            "resume_data": str(parsed), "jd_data": str(jd_data),
+        })
+        output = ResumeScreeningOutput(
+            candidate_name=parsed.get("candidate_name") or result.candidate_name,
+            skills=parsed.get("skills", []),
+            experience_years=parsed.get("experience_years", result.experience_years),
+            education=parsed.get("education", result.education),
+            summary=result.summary,
+            match_score=self._calculate_match_score(parsed.get("skills", []), jd_data),
+            extracted_fields={
+                "certifications": parsed.get("certifications", []),
+                "past_roles": parsed.get("past_roles", []),
+            },
+        )
+        self._persist_screening(
+            output,
+            ResumeScreeningInput(resume_text=resume_text, job_description=jd_data),
+            resume_filename,
+        )
+        return output
+
+    async def screen_batch_async(
+        self, resumes: list[dict], jd_data: dict, on_progress=None, jd_analysis_task=None
+    ):
+        """Fan out independent screenings with a provider-safe concurrency cap.
+
+        Each resume is screened as its own ``asyncio`` task, capped by the
+        ``SCREENING_CONCURRENCY`` environment variable (default 5) so a burst
+        does not overload Gemini or a local Ollama.  Failures are isolated via
+        ``return_exceptions=True``: a bad parse or transient API error in one
+        resume never cancels the in-flight tasks for the others.
+
+        Resume parsing is JD-independent, so the batch parses every resume
+        while the shared JD analysis runs as ``jd_analysis_task``; scoring of
+        each resume starts only after both its own parse and the JD task have
+        resolved.  If the JD task fails, resumes are scored against the raw
+        ``jd_data`` instead of failing the whole batch.
+
+        Args:
+            resumes: List of ``{"name": ..., "text": ...}`` resume documents.
+            jd_data: Parsed job description shared across the whole batch.
+            on_progress: Optional callback invoked as soon as each resume
+                finishes, with ``(completed, total, name, result, error)``.
+                ``result`` is the :class:`ResumeScreeningOutput` (or ``None``)
+                and ``error`` the exception (or ``None``).  This lets the UI
+                persist + render results progressively, before the batch ends.
+            jd_analysis_task: Optional ``asyncio.Task`` that produces the
+                structured JD dict.  When given, it is awaited for the JD used
+                in scoring.
+
+        Returns:
+            One entry per input resume, in the same order — a
+            :class:`ResumeScreeningOutput` on success or the ``Exception``
+            instance on failure.
+        """
+        limit = max(1, int(os.getenv("SCREENING_CONCURRENCY", "5")))
+        semaphore = asyncio.Semaphore(limit)
+        completed = 0
+
+        async def run_one(resume: dict):
+            nonlocal completed
+            result = None
+            error = None
+            try:
+                async with semaphore:
+                    text = str(resume.get("text") or "").strip()
+                    if not text:
+                        raise ValueError("Resume contains no extractable text.")
+                    parsed = await self.parser.parse_text_async(text)
+                    scoring_jd = jd_data
+                    if jd_analysis_task is not None:
+                        try:
+                            scoring_jd = await jd_analysis_task
+                        except Exception:
+                            logger.exception(
+                                "JD analysis task failed; scoring against raw JD"
+                            )
+                    result = await self.screen_parsed_async(
+                        parsed, text, scoring_jd, resume.get("name")
+                    )
+                    return result
+            except Exception as exc:
+                error = exc
+                raise
+            finally:
+                completed += 1
+                if on_progress:
+                    try:
+                        on_progress(
+                            completed,
+                            len(resumes),
+                            resume.get("name") or "Resume",
+                            result,
+                            error,
+                        )
+                    except Exception:
+                        logger.exception("Screening progress callback failed")
+
+        return await asyncio.gather(
+            *(run_one(resume) for resume in resumes), return_exceptions=True
+        )
+
+    def _persist_screening(self, output, input_data, resume_filename) -> None:
+        """Best-effort persistence shared by synchronous and async paths."""
+        try:
+            from db.database import Database
+            db = Database()
+            jd_id = db.persist_job_description(input_data.job_description)
+            candidate_id = db.persist_candidate(output.candidate_name, input_data.resume_text, resume_filename, output.skills, output.experience_years)
+            db.insert_screening(candidate_id, jd_id, output.summary, output.skills, [])
+        except Exception:
+            logger.exception("Failed to persist resume screening result")
 
     def screen_resume_text(
         self,

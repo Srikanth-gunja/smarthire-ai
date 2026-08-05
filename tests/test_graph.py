@@ -10,7 +10,7 @@ state propagation, not agent internals.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -52,9 +52,15 @@ def mock_supervisor(mock_llm):
 
 @pytest.fixture
 def mock_resume_agent():
-    """ResumeScreeningAgent mock that returns a fixed ScreeningResult."""
+    """ResumeScreeningAgent mock that returns a fixed ScreeningResult.
+
+    The graph node now drives screening through the parallel
+    ``screen_batch_async`` interface, so the mock exposes an awaitable batch
+    that returns one output per non-empty resume input (and an exception for
+    empty ones, mirroring the real agent's isolation behaviour).
+    """
     agent = MagicMock()
-    agent.screen_resume.return_value = ResumeScreeningOutput(
+    output = ResumeScreeningOutput(
         candidate_name="Sarah Chen",
         skills=["Python", "React", "Docker", "PostgreSQL"],
         experience_years=6.0,
@@ -65,6 +71,27 @@ def mock_resume_agent():
         match_score=85.0,
         extracted_fields={"certifications": [], "past_roles": []},
     )
+    agent.screen_resume = MagicMock(return_value=output)
+
+    async def _fake_batch(resumes, jd_data, on_progress=None, jd_analysis_task=None):
+        results = []
+        for index, resume in enumerate(resumes):
+            text = str(resume.get("text") or "").strip()
+            if not text:
+                results.append(ValueError("Resume contains no extractable text."))
+                continue
+            results.append(output)
+            if on_progress:
+                on_progress(
+                    index + 1,
+                    len(resumes),
+                    resume.get("name") or "Resume",
+                    output,
+                    None,
+                )
+        return results
+
+    agent.screen_batch_async = MagicMock(side_effect=_fake_batch)
     return agent
 
 
@@ -72,20 +99,22 @@ def mock_resume_agent():
 def mock_matching_agent():
     """CandidateMatchingAgent mock that returns a single ranked candidate."""
     agent = MagicMock()
-    agent.rank_candidates.return_value = CandidateMatchingOutput(
-        ranked_candidates=[
-            RankedCandidate(
-                candidate_name="Sarah Chen",
-                match_score=85.0,
-                skills_match=["Python", "React"],
-                skills_gap=["Kubernetes"],
-                experience_match=True,
-                justification="Strong match with core requirements.",
-                rank=1,
-            ),
-        ],
-        total_candidates_evaluated=1,
-        summary="Top candidate identified: Sarah Chen.",
+    agent.rank_candidates_async = AsyncMock(
+        return_value=CandidateMatchingOutput(
+            ranked_candidates=[
+                RankedCandidate(
+                    candidate_name="Sarah Chen",
+                    match_score=85.0,
+                    skills_match=["Python", "React"],
+                    skills_gap=["Kubernetes"],
+                    experience_match=True,
+                    justification="Strong match with core requirements.",
+                    rank=1,
+                ),
+            ],
+            total_candidates_evaluated=1,
+            summary="Top candidate identified: Sarah Chen.",
+        )
     )
     return agent
 
@@ -176,8 +205,8 @@ class TestResumeThenMatching:
         assert result["current_intent"] == "multi_intent"
 
         # Both agents were invoked
-        mock_resume_agent.screen_resume.assert_called_once()
-        mock_matching_agent.rank_candidates.assert_called_once()
+        mock_resume_agent.screen_batch_async.assert_called_once()
+        mock_matching_agent.rank_candidates_async.assert_called_once()
 
         # State was populated by both agents
         assert len(result.get("resumes", [])) == 1
@@ -228,7 +257,7 @@ class TestResumeThenMatching:
         compiled.invoke(state)
 
         # Verify the matching agent received data from screening
-        call_args = mock_matching_agent.rank_candidates.call_args
+        call_args = mock_matching_agent.rank_candidates_async.call_args
         input_to_matching = call_args[0][0]  # positional arg
         assert len(input_to_matching.resumes) == 1
         assert input_to_matching.resumes[0]["candidate_name"] == "Sarah Chen"
@@ -308,8 +337,8 @@ class TestInterviewScheduling:
         result = compiled.invoke(state)
 
         assert result["current_intent"] == "interview_scheduling"
-        mock_resume_agent.screen_resume.assert_not_called()
-        mock_matching_agent.rank_candidates.assert_not_called()
+        mock_resume_agent.screen_batch_async.assert_not_called()
+        mock_matching_agent.rank_candidates_async.assert_not_called()
         mock_hr_agent.answer_query.assert_not_called()
 
         # The scheduler mock produces no slots, so reflection flags the
@@ -411,8 +440,8 @@ class TestHRAssistant:
 
         assert result["current_intent"] == "hr_question"
         mock_hr_agent.answer_query.assert_called_once()
-        mock_resume_agent.screen_resume.assert_not_called()
-        mock_matching_agent.rank_candidates.assert_not_called()
+        mock_resume_agent.screen_batch_async.assert_not_called()
+        mock_matching_agent.rank_candidates_async.assert_not_called()
         mock_scheduler_agent.propose_schedule.assert_not_called()
 
         # hr_answers and final_response populated
@@ -580,8 +609,8 @@ class TestEdgeCases:
         result = compiled.invoke(state)
 
         # No agents should have been called
-        mock_resume_agent.screen_resume.assert_not_called()
-        mock_matching_agent.rank_candidates.assert_not_called()
+        mock_resume_agent.screen_batch_async.assert_not_called()
+        mock_matching_agent.rank_candidates_async.assert_not_called()
         mock_scheduler_agent.propose_schedule.assert_not_called()
         mock_hr_agent.answer_query.assert_not_called()
 
@@ -617,8 +646,8 @@ class TestEdgeCases:
 
         result = compiled.invoke(state)
 
-        mock_resume_agent.screen_resume.assert_called_once()
-        mock_matching_agent.rank_candidates.assert_not_called()
+        mock_resume_agent.screen_batch_async.assert_called_once()
+        mock_matching_agent.rank_candidates_async.assert_not_called()
         assert result.get("resumes")
         assert result.get("final_response")
 
@@ -659,6 +688,83 @@ class TestEdgeCases:
 
 
 # ── Supervisor role policy ────────────────────────────────────────────
+
+
+class TestParallelScreening:
+    """Parallel screening: per-resume failures are isolated and recorded."""
+
+    def test_failed_resume_recorded_and_rest_still_ranked(
+        self,
+        mock_supervisor,
+        mock_matching_agent,
+        mock_scheduler_agent,
+        mock_hr_agent,
+    ):
+        """One bad resume must not cancel the batch or stall downstream agents."""
+        mock_supervisor.classify_intent.return_value = ExecutionPlan(
+            intent="multi_intent",
+            agents_to_invoke=["resume_screening", "candidate_matching"],
+            reasoning="Screen and rank.",
+        )
+
+        good = ResumeScreeningOutput(
+            candidate_name="Good Candidate",
+            skills=["Python", "React"],
+            experience_years=4.0,
+            education=[],
+            summary="Good match.",
+            match_score=80.0,
+            extracted_fields={"certifications": [], "past_roles": []},
+        )
+        agent = MagicMock()
+
+        async def _fake_batch(resumes, jd_data, on_progress=None, jd_analysis_task=None):
+            results = []
+            for resume in resumes:
+                if "good" in str(resume.get("name", "")).lower():
+                    results.append(good)
+                else:
+                    results.append(ValueError("Corrupt file: could not parse resume."))
+            return results
+
+        agent.screen_batch_async = MagicMock(side_effect=_fake_batch)
+
+        compiled = build_graph(
+            mock_supervisor,
+            agent,
+            mock_matching_agent,
+            mock_scheduler_agent,
+            mock_hr_agent,
+        )
+
+        state: SmartHireState = {
+            "conversation_history": [
+                HumanMessage(content="Screen and rank candidates")
+            ],
+            "resume_inputs": [
+                {"name": "good.txt", "text": "Good resume"},
+                {"name": "bad.txt", "text": "Bad resume"},
+            ],
+            "job_description": {
+                "job_title": "Senior Developer",
+                "required_skills": ["Python", "React"],
+            },
+        }
+
+        result = compiled.invoke(state)
+
+        # The good resume screened; the bad one is recorded as a failure.
+        assert len(result.get("resumes", [])) == 1
+        assert result["resumes"][0]["candidate_name"] == "Good Candidate"
+        assert len(result.get("screening_failures", [])) == 1
+        failure = result["screening_failures"][0]
+        assert failure["screening_status"] == "failed"
+        assert failure["filename"] == "bad.txt"
+        assert "could not parse" in failure["error"]
+
+        # The rest of the pipeline still ran with the successful batch.
+        mock_matching_agent.rank_candidates_async.assert_called_once()
+        assert result.get("candidate_rankings")
 
 
 class TestSupervisorRolePolicy:
@@ -863,7 +969,7 @@ class TestReflectionCatchesIssues:
     ):
         """A candidate with zero JD skill overlap is flagged by reflection."""
         # Mock the matching agent to return a candidate with NO matching skills
-        mock_matching_agent.rank_candidates.return_value = CandidateMatchingOutput(
+        mock_matching_agent.rank_candidates_async.return_value = CandidateMatchingOutput(
             ranked_candidates=[
                 RankedCandidate(
                     candidate_name="Unqualified hire",
@@ -993,7 +1099,7 @@ class TestReflectionCatchesIssues:
             total_candidates_evaluated=1,
             summary="Top candidate identified: Sarah Chen.",
         )
-        mock_matching_agent.rank_candidates.side_effect = [
+        mock_matching_agent.rank_candidates_async.side_effect = [
             broken_output,
             fixed_output,
         ]
@@ -1025,10 +1131,10 @@ class TestReflectionCatchesIssues:
         result = compiled.invoke(state)
 
         # Candidate Matching ran twice: initial + one correction attempt.
-        assert mock_matching_agent.rank_candidates.call_count == 2
+        assert mock_matching_agent.rank_candidates_async.call_count == 2
 
         # The correction attempt received the reflection feedback.
-        retry_call = mock_matching_agent.rank_candidates.call_args[0][0]
+        retry_call = mock_matching_agent.rank_candidates_async.call_args[0][0]
         assert retry_call.reflection_feedback
         assert "zero overlap" in retry_call.reflection_feedback.lower()
 

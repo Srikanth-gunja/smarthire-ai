@@ -7,6 +7,7 @@ skills into a structured dict that agents can consume.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -79,9 +80,20 @@ class JDAnalyzer:
             min_experience_years, max_experience_years,
             education_requirements, and summary.
         """
+        return asyncio.run(self.analyze_async(jd_text))
+
+    async def analyze_async(self, jd_text: str) -> dict:
+        """Non-blocking variant of :meth:`analyze` for use inside async tasks.
+
+        Args:
+            jd_text: Raw job description text.
+
+        Returns:
+            Same structured dict as :meth:`analyze`.
+        """
         structured_llm = self.llm.with_structured_output(ExtractedJD)
         chain = JD_ANALYSIS_PROMPT | structured_llm
-        result = chain.invoke({"jd_text": jd_text})
+        result = await chain.ainvoke({"jd_text": jd_text})
         extracted = result.model_dump()
         extracted["required_skills"] = normalize_skill_list(extracted["required_skills"])
         extracted["preferred_skills"] = normalize_skill_list(extracted["preferred_skills"])

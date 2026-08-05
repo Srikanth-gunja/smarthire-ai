@@ -8,6 +8,7 @@ or answer HR questions.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -105,9 +106,22 @@ class CandidateMatchingAgent:
                 summary="No candidates to evaluate.",
             )
 
+        return asyncio.run(self.rank_candidates_async(input_data))
+
+    async def rank_candidates_async(
+        self, input_data: CandidateMatchingInput
+    ) -> CandidateMatchingOutput:
+        """Non-blocking variant of :meth:`rank_candidates` for async graph nodes."""
+        if not input_data.resumes:
+            return CandidateMatchingOutput(
+                ranked_candidates=[],
+                total_candidates_evaluated=0,
+                summary="No candidates to evaluate.",
+            )
+
         structured_llm = self.llm.with_structured_output(LLMMatchResult)
         chain = MATCHING_PROMPT | structured_llm
-        result = chain.invoke({
+        result = await chain.ainvoke({
             "candidates_data": str(input_data.resumes),
             "jd_data": str(input_data.job_description),
             "reflection_feedback": input_data.reflection_feedback or "None",
@@ -123,12 +137,19 @@ class CandidateMatchingAgent:
             summary=result.summary,
         )
 
-        # ── Persist to SQLite (never raises) ───────────────────────────
+        self._persist_rankings(ranked, input_data.resumes, input_data.job_description)
+
+        return output
+
+    def _persist_rankings(
+        self, ranked, resumes, job_description
+    ) -> None:
+        """Best-effort persistence of the ranking to SQLite (never raises)."""
         try:
             from db.database import Database
 
             db = Database()
-            jd_id = db.persist_job_description(input_data.job_description)
+            jd_id = db.persist_job_description(job_description)
             for candidate in ranked:
                 candidate_id = db.find_candidate_by_name(candidate.candidate_name)
                 if candidate_id is None:
@@ -136,7 +157,7 @@ class CandidateMatchingAgent:
                     # screened resume data so the ranking FK is satisfied.
                     resume_data = next(
                         (
-                            r for r in input_data.resumes
+                            r for r in resumes
                             if r.get("candidate_name") == candidate.candidate_name
                         ),
                         {},
@@ -156,8 +177,6 @@ class CandidateMatchingAgent:
                 )
         except Exception:
             logger.exception("Failed to persist candidate ranking result")
-
-        return output
 
     def _compute_skills_match(
         self, resume_skills: list[str], jd_skills: list[str]
