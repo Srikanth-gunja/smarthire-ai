@@ -1910,8 +1910,7 @@ with st.sidebar:
                 st.markdown(
                     f"<div style='background:#ECFDF5;border:1px solid #22C55E;"
                     f"border-radius:8px;padding:8px 10px;margin-bottom:6px'>"
-                    f"<span style='color:#16A34A;font-weight:700'>● {label} — "
-                    f"active</span></div>",
+                    f"<span style='color:#16A34A;font-weight:700'>{label}</span></div>",
                     unsafe_allow_html=True,
                 )
             else:
