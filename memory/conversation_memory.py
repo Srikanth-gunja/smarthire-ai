@@ -29,7 +29,7 @@ import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,10 @@ _CONVERSATION_MEMORY_NS = "conversation_memory"
 # Stable checkpoint id used for the ConversationMemory checkpoint so a thread
 # holds exactly one session-data row (INSERT OR REPLACE) per save.
 _CONVERSATION_MEMORY_CHECKPOINT_ID = "00000000-0000-0000-0000-000000000000"
+
+# Sessions idle for longer than this are purged (state cleared) the next time
+# a new browser opens the app, so closed-browser data does not linger.
+_SESSION_TTL_HOURS = 1.0
 
 # Cached SqliteSaver instances keyed by resolved db path.
 _checkpointers: dict[str, Any] = {}
@@ -192,6 +196,40 @@ class ConversationMemory:
 
     # ── Session lifecycle ──────────────────────────────────────────────
 
+    def cleanup_expired_sessions(self, max_age_hours: float = _SESSION_TTL_HOURS) -> int:
+        """Delete sessions (and all their data) idle for ``max_age_hours``.
+
+        Runs whenever a new session is created, so each new visitor purges
+        closed-browser state from earlier visitors.  Removes the session row,
+        its chat/uploads/interview records, and the LangGraph checkpoints.
+        """
+        cutoff = (
+            datetime.now(UTC) - timedelta(hours=max_age_hours)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        rows = self.db.fetch_all(
+            "SELECT id FROM sessions WHERE last_active_at < ?", (cutoff,)
+        )
+        count = 0
+        for row in rows:
+            session_id = row["id"]
+            self._sessions.pop(session_id, None)
+            try:
+                self._saver.delete_thread(session_id)
+            except Exception:
+                logger.exception(
+                    "Failed to clear checkpoints for session %s", session_id
+                )
+            self.db.delete_session_data(session_id)
+            self.db.delete_session(session_id)
+            count += 1
+        if count:
+            logger.info(
+                "Expired %d stale session(s) idle over %.1f hour(s)",
+                count,
+                max_age_hours,
+            )
+        return count
+
     def create_session(self, mode: str | None = None) -> str:
         """Create a new empty session, persist it, and return its id.
 
@@ -201,6 +239,7 @@ class ConversationMemory:
         Returns:
             A new UUID-based session identifier (== LangGraph thread_id).
         """
+        self.cleanup_expired_sessions()
         session_id = uuid.uuid4().hex[:12]
         self._sessions[session_id] = SessionData()
         self.db.upsert_session(session_id, mode)

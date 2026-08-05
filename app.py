@@ -223,39 +223,6 @@ def _restore_state(session_id: str) -> SmartHireState:
     return SmartHireState(conversation_history=[])
 
 
-def _load_past_session(session_id: str) -> None:
-    """Switch the app to a previously saved session (chat + ranking results).
-
-    Restores the human-readable transcripts (per recruiter/candidate mode)
-    from ``chat_messages`` and the agent outputs (rankings, slots, final
-    response) from the LangGraph checkpointer, then reruns so the chosen
-    session is rendered.
-    """
-    audit = ChatAudit()
-    st.session_state.session_id = session_id
-    audit.save_session_id(session_id)
-    row = Database().fetch_one(
-        "SELECT mode FROM sessions WHERE id = ?", (session_id,)
-    )
-    mode = "candidate" if row and row["mode"] == "candidate" else "recruiter"
-    st.session_state.chats = _load_all_chats(session_id, audit)
-    st.session_state.graph_state = _restore_state(session_id)
-    _clear_upload_widget_state()
-    _restore_session_uploads(session_id)
-    st.session_state.show_results = True
-    st.session_state.mode_picker = (
-        "Candidate" if mode == "candidate" else "Recruiter"
-    )
-    # Restore paused state if the session was interrupted mid-pipeline
-    paused = Database().get_session_paused(session_id)
-    if paused:
-        st.session_state.paused_at_node = paused["paused_at_node"]
-        st.session_state.paused_error = paused["error_message"]
-    else:
-        st.session_state.pop("paused_at_node", None)
-        st.session_state.pop("paused_error", None)
-
-
 def _restore_session_uploads(session_id: str) -> None:
     """Restore retained source documents so Screening stays usable per session."""
     resumes: list[dict] = []
@@ -344,47 +311,15 @@ def _reset_current_session() -> None:
     st.session_state.recruiter_tab = "Resume Screening"
     st.session_state.pop("paused_at_node", None)
     st.session_state.pop("paused_error", None)
-    audit.save_session_id(session_id)
-
-
-def _clear_all_sessions() -> None:
-    """Remove every saved session, upload, workflow result, and chat record."""
-    ChatAudit().clear_session_id()
-    ConversationMemory().clear_all_sessions()
-    _start_new_session()
-    st.session_state.flash = "All saved sessions and their uploaded files were cleared."
-
-
-def _start_new_session() -> None:
-    """Create an explicitly requested blank session and switch to it."""
-    audit = ChatAudit()
-    mode = "candidate" if st.session_state.mode_picker == "Candidate" else "recruiter"
-    session_id = ConversationMemory().create_session(mode)
-    st.session_state.session_id = session_id
-    audit.save_session_id(session_id)
-    _clear_upload_widget_state()
-    st.session_state.chats = {"candidate": [], "recruiter": []}
-    st.session_state.graph_state = SmartHireState(conversation_history=[])
-    st.session_state.resume_texts = []
-    st.session_state.jd_data = None
-    st.session_state.show_results = False
-    st.session_state.sched = None
-    st.session_state.recruiter_tab = "Resume Screening"
-    st.session_state.pop("paused_at_node", None)
-    st.session_state.pop("paused_error", None)
 
 
 # ── Session init ──────────────────────────────────────────────────────
 
 if "session_id" not in st.session_state:
-    audit = ChatAudit()
-    # Resume the mirrored session id, else the most recent persisted session,
-    # else start fresh — so conversation survives browser refreshes.
-    sid = audit.restore_session_id() or ConversationMemory().resume_last_session()
-    if not sid:
-        sid = ConversationMemory().create_session()
-    audit.save_session_id(sid)
-    st.session_state.session_id = sid
+    # Every browser gets its own private thread. Nothing is restored from a
+    # shared file or a global "most recent session", so multiple members on
+    # the same URL never see each other's data.
+    st.session_state.session_id = ConversationMemory().create_session()
 if "graph_state" not in st.session_state:
     st.session_state.graph_state = _restore_state(st.session_state.session_id)
 if "chats" not in st.session_state:
@@ -1889,40 +1824,6 @@ with st.sidebar:
 
     st.divider()
 
-    with st.expander("Past Sessions"):
-        sessions = Database().get_sessions()
-        if not sessions:
-            st.caption("No past sessions yet.")
-        # Fixed order by original creation time (started_at), so loading a
-        # session never re-sorts it to the top.
-        sessions = sorted(
-            sessions,
-            key=lambda s: str(s["started_at"] or ""),
-            reverse=True,
-        )
-        for s in sessions:
-            sid = s["id"]
-            mode_name = s["mode"].capitalize() if s["mode"] else "Unknown"
-            timestamp = str(s["started_at"])[:16]
-            label = f"{mode_name} · {timestamp} · {sid[:8]}"
-            if sid == st.session_state.session_id:
-                st.markdown(
-                    f"<div style='background:#ECFDF5;border:1px solid #22C55E;"
-                    f"border-radius:8px;padding:8px 10px;margin-bottom:6px'>"
-                    f"<span style='color:#16A34A;font-weight:700'>{label}</span></div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.button(
-                    label,
-                    key=f"past_session_{sid}",
-                    use_container_width=True,
-                    on_click=_load_past_session,
-                    args=(sid,),
-                )
-
-    st.divider()
-
     st.markdown("#### Model Provider")
     _provider = st.segmented_control(
         "Provider",
@@ -1981,16 +1882,8 @@ with st.sidebar:
 
     st.divider()
 
-    if st.button("New Session", type="primary", use_container_width=True):
-        _start_new_session()
-        st.rerun()
-
     if st.button("Clear Current Session", type="secondary", use_container_width=True):
         _reset_current_session()
-        st.rerun()
-
-    if st.button("Clear All Sessions", type="secondary", use_container_width=True):
-        _clear_all_sessions()
         st.rerun()
 
 
