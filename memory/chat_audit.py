@@ -122,7 +122,10 @@ class ChatAudit:
                 agent_name, text = self._extract_agent_turn(msg)
                 if agent_name:
                     self.log_agent(session_id, agent_name, text)
-            final = (result.get("final_response") or "").strip()
+            final_val = result.get("final_response") or ""
+            if isinstance(final_val, list):
+                final_val = " ".join(str(m) for m in final_val)
+            final = str(final_val).strip()
             if final:
                 self.log_assistant(session_id, final)
         elif answer:

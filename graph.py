@@ -30,6 +30,91 @@ from supervisor import Supervisor
 logger = logging.getLogger(__name__)
 
 
+# ── Transient error handling ──────────────────────────────────────────
+
+
+class TransientError(Exception):
+    """Raised when a node fails due to a transient provider error (503, overload, timeout)."""
+
+    def __init__(self, node_name: str, message: str) -> None:
+        self.node_name = node_name
+        self.message = message
+        super().__init__(f"[{node_name}] {message}")
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Return True if the exception represents a transient provider error."""
+    msg = str(exc).lower()
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    status_code = getattr(exc, "status_code", None)
+
+    # Check numeric status codes
+    for val in (code, status, status_code):
+        if val == 503 or (isinstance(val, int) and 500 <= val < 600):
+            return True
+
+    # Check error message patterns
+    transient_signals = [
+        "503", "overloaded", "overloaded_error", "resource_exhausted",
+        "rate limit", "429", "unavailable", "deadline_exceeded",
+        "timeout", "timed out", "connection reset", "connection refused",
+        "server returned", "model is currently overloaded",
+        "internal server error",
+    ]
+    return any(signal in msg for signal in transient_signals)
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """Return True if the exception represents an auth/key error (should NOT be retried)."""
+    msg = str(exc).lower()
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    status_code = getattr(exc, "status_code", None)
+
+    for val in (code, status, status_code):
+        if val in (401, 403):
+            return True
+
+    auth_signals = ["api_key", "auth", "permission", "invalid_key", "deprecated"]
+    return any(signal in msg for signal in auth_signals)
+
+
+def _wrap_node(node_fn: Any, node_name: str, session_id: str = "") -> Any:
+    """Wrap a graph node function with transient error handling.
+
+    On a transient error the node:
+      1. Records the pause state in the sessions DB table.
+      2. Re-raises as TransientError so the stream stops cleanly.
+    Auth errors are re-raised as-is (not resumeable).
+    """
+
+    def wrapper(state: SmartHireState) -> dict:
+        try:
+            return node_fn(state)
+        except TransientError:
+            raise
+        except Exception as exc:
+            if _is_transient_error(exc):
+                _record_pause(session_id, node_name, exc)
+                raise TransientError(node_name, str(exc)) from exc
+            raise
+
+    return wrapper
+
+
+def _record_pause(session_id: str, node_name: str, exc: Exception) -> None:
+    """Persist the paused state to the sessions table."""
+    if not session_id:
+        return
+    try:
+        from db.database import Database
+        Database().update_session_paused(session_id, node_name, str(exc))
+        logger.warning("Session %s paused at %s: %s", session_id, node_name, exc)
+    except Exception:
+        logger.exception("Failed to record pause state for session %s", session_id)
+
+
 # ── Routing helpers ───────────────────────────────────────────────────
 
 
@@ -375,14 +460,14 @@ def build_graph(
 
     graph = StateGraph(SmartHireState)
 
-    # Nodes
-    graph.add_node("supervisor", supervisor_node)
-    graph.add_node("resume_screening", resume_screening_node)
-    graph.add_node("candidate_matching", candidate_matching_node)
-    graph.add_node("interview_scheduling", interview_scheduling_node)
-    graph.add_node("hr_assistant", hr_assistant_node)
-    graph.add_node("memory_update", memory_update_node)
-    graph.add_node("reflection", reflection_node)
+    # Nodes — wrapped with transient error handling for resumable execution
+    graph.add_node("supervisor", _wrap_node(supervisor_node, "supervisor", session_id))
+    graph.add_node("resume_screening", _wrap_node(resume_screening_node, "resume_screening", session_id))
+    graph.add_node("candidate_matching", _wrap_node(candidate_matching_node, "candidate_matching", session_id))
+    graph.add_node("interview_scheduling", _wrap_node(interview_scheduling_node, "interview_scheduling", session_id))
+    graph.add_node("hr_assistant", _wrap_node(hr_assistant_node, "hr_assistant", session_id))
+    graph.add_node("memory_update", _wrap_node(memory_update_node, "memory_update", session_id))
+    graph.add_node("reflection", _wrap_node(reflection_node, "reflection", session_id))
 
     # Entry point
     graph.set_entry_point("supervisor")
@@ -591,6 +676,54 @@ def run_smarthire_stream(
     input_state = _prepare_input_state(user_input, state, checkpointer, config)
 
     for event in compiled.stream(input_state, config=config, stream_mode="debug"):
+        event_type = event.get("type")
+        node_name = (event.get("payload") or {}).get("name")
+        if event_type in ("task", "task_result") and node_name:
+            yield event_type, node_name
+
+
+def run_smarthire_stream_updates(
+    user_input: str,
+    state: SmartHireState | None = None,
+    session_id: str | None = None,
+):
+    """Stream the pipeline yielding ``(node_name, state_update)`` per node.
+
+    Uses ``stream_mode="updates"`` so each completed node's output dict is
+    yielded immediately — enabling incremental rendering of results in the UI.
+
+    Yields:
+        Tuples of ``(node_name, state_update_dict)`` where state_update_dict
+        contains the keys written by that node (e.g. ``{"resumes": [...]}``).
+    """
+    session_id = _resolve_session(session_id)
+    compiled, checkpointer, config = _build_components(session_id)
+    input_state = _prepare_input_state(user_input, state, checkpointer, config)
+
+    for chunk in compiled.stream(input_state, config=config, stream_mode="updates"):
+        # stream_mode="updates" yields dicts like {"node_name": {state_update}}
+        for node_name, update in chunk.items():
+            if update:
+                yield node_name, dict(update)
+
+
+def resume_run(session_id: str):
+    """Resume a paused pipeline from the last successful checkpoint.
+
+    Re-invokes the compiled graph with no new input on the same thread_id,
+    causing LangGraph to pick up from the last saved checkpoint.  Completed
+    nodes will NOT re-execute; only the failed node and subsequent ones run.
+
+    Yields:
+        Pairs of ``(event_type, node_name)`` just like ``run_smarthire_stream``.
+    """
+    from db.database import Database
+
+    Database().clear_session_paused(session_id)
+    compiled, _checkpointer, config = _build_components(session_id)
+
+    # Empty input + existing checkpoint = resume from last checkpoint
+    for event in compiled.stream({}, config=config, stream_mode="debug"):
         event_type = event.get("type")
         node_name = (event.get("payload") or {}).get("name")
         if event_type in ("task", "task_result") and node_name:

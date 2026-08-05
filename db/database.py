@@ -78,7 +78,19 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(str(self.db_path), timeout=30) as conn:
             conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+            # Migration: add columns to existing sessions table if missing
+            self._migrate_sessions(conn)
         self._schema_ready = True
+
+    @staticmethod
+    def _migrate_sessions(conn: sqlite3.Connection) -> None:
+        """Add new columns to the sessions table for existing databases."""
+        cursor = conn.execute("PRAGMA table_info(sessions)")
+        existing = {row[1] for row in cursor.fetchall()}
+        if "paused_at_node" not in existing:
+            conn.execute("ALTER TABLE sessions ADD COLUMN paused_at_node TEXT")
+        if "error_message" not in existing:
+            conn.execute("ALTER TABLE sessions ADD COLUMN error_message TEXT")
 
     # ── Connections ────────────────────────────────────────────────────
 
@@ -174,6 +186,43 @@ class Database:
             "SELECT * FROM sessions "
             "ORDER BY last_active_at DESC, started_at DESC, rowid DESC"
         )
+
+    def update_session_paused(
+        self, session_id: str, node_name: str, error_message: str
+    ) -> None:
+        """Mark a session as paused due to a transient error."""
+        self.execute(
+            """
+            UPDATE sessions
+            SET paused_at_node = ?, error_message = ?, last_active_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (node_name, error_message, session_id),
+        )
+
+    def clear_session_paused(self, session_id: str) -> None:
+        """Clear the paused state after a successful resume or retry."""
+        self.execute(
+            """
+            UPDATE sessions
+            SET paused_at_node = NULL, error_message = NULL, last_active_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (session_id,),
+        )
+
+    def get_session_paused(self, session_id: str) -> dict | None:
+        """Return the paused state for a session, or None if not paused."""
+        row = self.fetch_one(
+            "SELECT paused_at_node, error_message FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+        if row and row["paused_at_node"]:
+            return {
+                "paused_at_node": row["paused_at_node"],
+                "error_message": row["error_message"] or "",
+            }
+        return None
 
     # ── Job descriptions ───────────────────────────────────────────────
 

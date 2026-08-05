@@ -351,6 +351,28 @@ def check_all_questions_answered(state: SmartHireState) -> dict:
 # ── Check (d): Clarity and consistency polish ──────────────────────────
 
 
+def _extract_text(content: object) -> str:
+    """Extract plain text from an LLM response content value.
+
+    Gemini may return a list of parts (dicts with 'text'/'signature'/'extras'),
+    a plain string, or an object with a ``.content`` attribute.  This helper
+    normalises all of those to a single trimmed string.
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for p in content:
+            if isinstance(p, dict):
+                t = p.get("text", "")
+            else:
+                t = str(p)
+            if t:
+                parts.append(t)
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
 def improve_clarity_and_consistency(
     state: SmartHireState,
     llm: ChatOllama | None = None,
@@ -418,7 +440,7 @@ def improve_clarity_and_consistency(
             ])
             chain = polish_prompt | llm
             result = chain.invoke({"raw_output": fallback_response})
-            return result.content
+            return _extract_text(result.content)
         except Exception:
             logger.exception("LLM polish failed, using deterministic fallback")
 
@@ -491,7 +513,7 @@ def run_reflection(
     checks.append(check_all_questions_answered(state))
 
     # Check (d): clarity and consistency
-    final_response = improve_clarity_and_consistency(state, llm)
+    final_response = _extract_text(improve_clarity_and_consistency(state, llm))
     clarity_notes = []
     if state.get("resumes") or state.get("candidate_rankings") or state.get(
         "hr_answers"
@@ -582,7 +604,7 @@ def run_reflection(
         "reflection_attempts": attempts + 1,
         "retry_agent": retry_agent,
         "reflection_feedback": feedback,
-        "final_response": final_response,
+        "final_response": _extract_text(final_response),
         # If schedule conflicts were found, update the slots in state.
         **(
             {"interview_slots": cleaned_slots}

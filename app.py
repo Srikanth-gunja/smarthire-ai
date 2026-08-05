@@ -206,6 +206,14 @@ def _load_past_session(session_id: str) -> None:
     st.session_state.mode_picker = (
         "Candidate" if row and row["mode"] == "candidate" else "Recruiter"
     )
+    # Restore paused state if the session was interrupted mid-pipeline
+    paused = Database().get_session_paused(session_id)
+    if paused:
+        st.session_state.paused_at_node = paused["paused_at_node"]
+        st.session_state.paused_error = paused["error_message"]
+    else:
+        st.session_state.pop("paused_at_node", None)
+        st.session_state.pop("paused_error", None)
 
 
 def _reset_current_session() -> None:
@@ -215,6 +223,7 @@ def _reset_current_session() -> None:
     mode = "candidate" if st.session_state.mode_picker == "Candidate" else "recruiter"
     ConversationMemory().reset_session(session_id, mode)
     audit.clear(session_id)
+    Database().clear_session_paused(session_id)
     st.session_state.chat_messages = []
     st.session_state.graph_state = SmartHireState(conversation_history=[])
     st.session_state.resume_texts = []
@@ -222,6 +231,8 @@ def _reset_current_session() -> None:
     st.session_state.show_results = False
     st.session_state.sched = None
     st.session_state.recruiter_tab = "Upload & Screen"
+    st.session_state.pop("paused_at_node", None)
+    st.session_state.pop("paused_error", None)
     audit.save_session_id(session_id)
 
 
@@ -239,6 +250,8 @@ def _start_new_session() -> None:
     st.session_state.show_results = False
     st.session_state.sched = None
     st.session_state.recruiter_tab = "Upload & Screen"
+    st.session_state.pop("paused_at_node", None)
+    st.session_state.pop("paused_error", None)
 
 
 # ── Session init ──────────────────────────────────────────────────────
@@ -273,6 +286,10 @@ if "mode_picker" not in st.session_state:
     )
 if "recruiter_tab" not in st.session_state:
     st.session_state.recruiter_tab = "Upload & Screen"
+if "llm_provider" not in st.session_state:
+    st.session_state.llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+if "gemini_api_key" not in st.session_state:
+    st.session_state.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
 
 
 # ── Environment helpers ───────────────────────────────────────────────
@@ -280,8 +297,9 @@ if "recruiter_tab" not in st.session_state:
 
 def _check_llm() -> bool:
     """Validate the selected model provider without exposing credentials."""
-    if os.getenv("LLM_PROVIDER", "ollama").strip().lower() == "gemini":
-        return bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+    provider = st.session_state.get("llm_provider") or "ollama"
+    if provider == "gemini":
+        return bool(st.session_state.get("gemini_api_key", "").strip())
     import urllib.error
     import urllib.request
 
@@ -324,31 +342,296 @@ def _iter_pipeline(user_input: str):
     )
 
 
-def _run_with_progress(progress_title: str) -> None:
-    """Run the current graph task, streaming a live stage checklist.
+def _iter_resume_pipeline():
+    """Stream the graph resuming from the last checkpoint, yielding (event_type, node_name)."""
+    from graph import resume_run
 
-    Reads the final state from the checkpointer after streaming and stores it
-    back into ``st.session_state.graph_state``.
-    """
-    with st.status(progress_title, expanded=True) as status:
-        status.update(label="Starting agents…", state="running")
-        progress_ph = st.empty()
-        completed: list[str] = []
-        running: str | None = None
-        for event_type, node in _iter_pipeline(st.session_state.pending_input):
-            if event_type == "task":
-                running = node
-                status.update(label=f"Running: {_agent_label(node)}", state="running")
-            else:
-                completed.append(node)
-                running = None
-            progress_ph.markdown(
-                _stage_checklist(completed, running), unsafe_allow_html=True
-            )
-        status.update(label="✓ Pipeline complete", state="complete", expanded=False)
-        progress_ph.markdown(_stage_checklist(completed, None), unsafe_allow_html=True)
+    return resume_run(st.session_state.session_id)
 
+
+def _show_paused_state(node_name: str, error_msg: str) -> None:
+    """Display the paused state with Resume and Retry buttons."""
+    state = st.session_state.graph_state
+    # Build the list of completed agents from conversation history
+    history = state.get("conversation_history", [])
+    completed_names = []
+    for msg in history:
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and content.startswith("["):
+            # Extract agent name from "[AgentName] ..." messages
+            bracket_end = content.index("]") if "]" in content else -1
+            if bracket_end > 1:
+                agent_tag = content[1:bracket_end].strip().lower().replace(" ", "_")
+                if agent_tag in AGENTS:
+                    completed_names.append(agent_tag)
+
+    completed_str = (
+        ", ".join(_agent_label(a) for a in completed_names)
+        if completed_names
+        else "None"
+    )
+
+    st.warning(
+        f"⚠️ Provider is experiencing high demand.\n\n"
+        f"**Completed:** {completed_str}\n\n"
+        f"**Paused at:** {_agent_label(node_name)}\n\n"
+        f"**Error:** {error_msg}",
+    )
+
+    col_resume, col_retry = st.columns(2)
+    with col_resume:
+        if st.button("🔄 Resume", type="primary", use_container_width=True, key="resume_btn"):
+            _run_resume_with_progress()
+            st.rerun()
+    with col_retry:
+        if st.button("🔁 Retry from start", type="secondary", use_container_width=True, key="retry_btn"):
+            st.session_state.graph_state = _restore_state(st.session_state.session_id)
+            st.session_state.pending_input = st.session_state.get("last_user_input", "")
+            _run_with_progress("Running multi-agent pipeline…")
+            st.rerun()
+
+
+def _run_resume_with_progress() -> None:
+    """Resume a paused pipeline from the last checkpoint, with progress UI."""
+    from graph import TransientError
+
+    try:
+        with st.status("Resuming pipeline…", expanded=True) as status:
+            status.update(label="Resuming from last checkpoint…", state="running")
+            progress_ph = st.empty()
+            completed: list[str] = []
+            running: str | None = None
+            for event_type, node in _iter_resume_pipeline():
+                if event_type == "task":
+                    running = node
+                    status.update(label=f"Running: {_agent_label(node)}", state="running")
+                else:
+                    completed.append(node)
+                    running = None
+                progress_ph.markdown(
+                    _stage_checklist(completed, running), unsafe_allow_html=True
+                )
+            status.update(label="✓ Pipeline complete", state="complete", expanded=False)
+            progress_ph.markdown(_stage_checklist(completed, None), unsafe_allow_html=True)
+    except TransientError as exc:
+        st.session_state.graph_state = _restore_state(st.session_state.session_id)
+        _show_paused_state(exc.node_name, exc.message)
+        return
+    except (ValueError, RuntimeError, KeyError) as exc:
+        st.error(f"Resume failed: {exc}")
+        return
+
+    # Resume completed successfully — clear paused state
+    Database().clear_session_paused(st.session_state.session_id)
+    st.session_state.pop("paused_at_node", None)
+    st.session_state.pop("paused_error", None)
     st.session_state.graph_state = _restore_state(st.session_state.session_id)
+
+
+# ── Incremental pipeline rendering ────────────────────────────────────
+
+
+def _iter_pipeline_updates(user_input: str):
+    """Stream the graph yielding (node_name, state_update) per node.
+
+    Uses ``stream_mode="updates"`` so each completed node's output is
+    available immediately for incremental rendering.
+    """
+    from graph import run_smarthire_stream_updates
+
+    state = dict(st.session_state.graph_state)
+    return run_smarthire_stream_updates(
+        user_input=user_input,
+        state=state,
+        session_id=st.session_state.session_id,
+    )
+
+
+def _render_resume_screening_section(resumes: list[dict]) -> None:
+    """Render Resume Screening results with a per-candidate detail view."""
+    st.markdown("### 📄 Resume Screening Results")
+    st.caption(
+        f"{len(resumes)} resume(s) screened. Select a candidate below to view details."
+    )
+
+    if not resumes:
+        _empty_state("📄", "No resumes screened", "Upload resumes to begin.")
+        return
+
+    names = [r.get("candidate_name", f"Candidate {i + 1}") for i, r in enumerate(resumes)]
+    selected = st.selectbox(
+        "Select candidate",
+        names,
+        key="screening_candidate_select",
+        label_visibility="collapsed",
+    )
+    idx = names.index(selected) if selected in names else 0
+    detail = resumes[idx]
+
+    with st.container(border=True):
+        st.markdown(f"#### {detail.get('candidate_name', 'Unknown')}")
+
+        skills = detail.get("skills", [])
+        if skills:
+            st.markdown("**Skills:**")
+            skill_tags = " ".join(
+                f"<span style='background:#E0F2FE;color:#0369A1;padding:2px 8px;"
+                f"border-radius:10px;font-size:0.82em;margin:2px;display:inline-block'>"
+                f"{s}</span>"
+                for s in skills
+            )
+            st.markdown(skill_tags, unsafe_allow_html=True)
+
+        education = detail.get("education", [])
+        if education:
+            st.markdown("**Education:**")
+            for edu in education:
+                if isinstance(edu, dict):
+                    degree = edu.get("degree", "")
+                    inst = edu.get("institution", "")
+                    year = edu.get("year", "")
+                    st.caption(f"• {degree} — {inst} ({year})" if year else f"• {degree} — {inst}")
+
+        summary = detail.get("summary", "")
+        if summary:
+            st.markdown("**Screening Summary:**")
+            st.info(summary)
+
+        extracted = detail.get("extracted_fields", {})
+        certs = extracted.get("certifications", [])
+        roles = extracted.get("past_roles", [])
+        if certs:
+            st.caption(f"**Certifications:** {', '.join(certs)}")
+        if roles:
+            with st.expander("Past roles"):
+                for role in roles:
+                    st.caption(f"• {role}")
+
+
+def _render_matching_section(rankings: list[dict]) -> None:
+    """Render Candidate Matching / ranking results."""
+    st.markdown("### 🎯 Candidate Rankings")
+    if not rankings:
+        _empty_state("🎯", "No rankings yet", "Candidate Matching is processing…")
+        return
+    st.markdown(
+        f"**{len(rankings)} candidate(s) ranked.** Click *Schedule Interview* "
+        "on any row to jump to Interview Scheduling."
+    )
+    _display_rankings(rankings)
+
+
+def _render_scheduling_section(slots: list[dict]) -> None:
+    """Render Interview Scheduling results."""
+    _display_interview_slots(slots)
+
+
+def _render_reflection_section(notes: dict) -> None:
+    """Render Reflection Node output."""
+    _render_reflection_summary(notes)
+
+
+# ── Staged pipeline runner ────────────────────────────────────────────
+
+
+def _run_with_progress(progress_title: str) -> None:
+    """Run the pipeline with incremental rendering of each agent's results.
+
+    Streams the graph using ``stream_mode="updates"``.  After each node
+    completes, its output is stored in ``st.session_state.graph_state`` and
+    rendered immediately below the progress indicator — so Resume Screening
+    results appear before Candidate Matching starts.
+    """
+    from graph import TransientError
+
+    completed: list[str] = []
+    running: str | None = None
+
+    try:
+        with st.status(progress_title, expanded=True) as status:
+            status.update(label="Starting agents…", state="running")
+            progress_ph = st.empty()
+
+            for node_name, update in _iter_pipeline_updates(st.session_state.pending_input):
+                # Mark this node as completed
+                if node_name not in completed:
+                    completed.append(node_name)
+                running = None
+
+                # Merge the update into graph_state
+                state = dict(st.session_state.graph_state)
+                for key, value in update.items():
+                    if key == "conversation_history":
+                        # Append reducer: extend, don't replace
+                        state.setdefault("conversation_history", []).extend(value)
+                    elif isinstance(state.get(key), list) and isinstance(value, list):
+                        # Other list fields: extend if both are lists
+                        state.setdefault(key, []).extend(value)
+                    else:
+                        state[key] = value
+                st.session_state.graph_state = state
+
+                # Update progress indicator
+                status.update(
+                    label=f"✓ {_agent_label(node_name)} complete",
+                    state="running",
+                )
+                progress_ph.markdown(
+                    _stage_checklist(completed, running), unsafe_allow_html=True
+                )
+
+                # Render the completed stage's results immediately
+                _render_stage(node_name, state)
+
+            status.update(label="✓ Pipeline complete", state="complete", expanded=False)
+            progress_ph.markdown(_stage_checklist(completed, None), unsafe_allow_html=True)
+
+    except TransientError as exc:
+        st.session_state.graph_state = _restore_state(st.session_state.session_id)
+        _show_paused_state(exc.node_name, exc.message)
+        return
+    except (ValueError, RuntimeError, KeyError) as exc:
+        msg = str(exc)
+        if "api_key" in msg.lower() or "auth" in msg.lower() or "permission" in msg.lower():
+            st.error(f"Gemini authentication failed: {msg}")
+        elif "quota" in msg.lower() or "limit" in msg.lower() or "429" in msg:
+            st.error(f"Gemini rate limit exceeded: {msg}")
+        elif "network" in msg.lower() or "timeout" in msg.lower() or "connect" in msg.lower():
+            st.error(f"Network error reaching Gemini: {msg}")
+        else:
+            st.error(f"Pipeline error: {msg}")
+        return
+
+    Database().clear_session_paused(st.session_state.session_id)
+    st.session_state.pop("paused_at_node", None)
+    st.session_state.pop("paused_error", None)
+    st.session_state.graph_state = _restore_state(st.session_state.session_id)
+
+
+def _render_stage(node_name: str, state: dict) -> None:
+    """Render the output section for a completed pipeline stage."""
+    if node_name == "resume_screening":
+        resumes = state.get("resumes", [])
+        if resumes:
+            _render_resume_screening_section(resumes)
+            st.divider()
+    elif node_name == "candidate_matching":
+        rankings = state.get("candidate_rankings", [])
+        if rankings:
+            _render_matching_section(rankings)
+            st.divider()
+    elif node_name == "interview_scheduling":
+        slots = state.get("interview_slots", [])
+        if slots:
+            _render_scheduling_section(slots)
+            st.divider()
+    elif node_name == "reflection":
+        notes = state.get("reflection_notes", {})
+        if notes:
+            _render_reflection_section(notes)
+            final = state.get("final_response", "")
+            if final:
+                st.info(f"**Summary:** {final}")
 
 
 def _schedule_candidate(name: str) -> None:
@@ -520,7 +803,11 @@ def _chat_section(input_placeholder: str) -> None:
             st.markdown(prompt)
 
         if not _llm_ok:
-            answer = "The selected AI provider is not configured or reachable. Check your .env settings."
+            _prov = (st.session_state.get("llm_provider") or "ollama").strip().lower()
+            if _prov == "gemini":
+                answer = "Add a Gemini API key in the sidebar to continue."
+            else:
+                answer = "Ollama is not reachable. Start `ollama serve` to continue."
             audit.log_turn(
                 st.session_state.session_id, user_content=prompt, answer=answer
             )
@@ -940,7 +1227,11 @@ def _render_upload_tab() -> None:
         use_container_width=True,
     ):
         if not _llm_ok:
-            st.error("Cannot run: the selected AI provider is not configured or reachable. Check .env.")
+            _prov = (st.session_state.get("llm_provider") or "ollama").strip().lower()
+            if _prov == "gemini":
+                st.error("Add a Gemini API key in the sidebar to continue.")
+            else:
+                st.error("Cannot run: Ollama is not reachable. Start `ollama serve`.")
         else:
             # Persist the raw JD so it survives restarts, and thread its id
             # through state so agents can reference it.
@@ -977,6 +1268,7 @@ def _render_upload_tab() -> None:
                 st.session_state.graph_state.get("conversation_history", [])
             )
             st.session_state.pending_input = combined
+            st.session_state.last_user_input = combined
             _run_with_progress("Running multi-agent pipeline…")
             ChatAudit().log_turn(
                 st.session_state.session_id,
@@ -987,30 +1279,40 @@ def _render_upload_tab() -> None:
 
     if st.session_state.get("show_results"):
         st.divider()
-        st.markdown("### 📊 Ranking Results")
         state = st.session_state.graph_state
+
+        # Render each completed stage's results incrementally
+        resumes = state.get("resumes", [])
+        if resumes:
+            _render_resume_screening_section(resumes)
+            st.divider()
+
+        rankings = state.get("candidate_rankings", [])
+        if rankings:
+            _render_matching_section(rankings)
+            st.divider()
+
+        slots = state.get("interview_slots", [])
+        if slots:
+            _render_scheduling_section(slots)
+            st.divider()
+
+        notes = state.get("reflection_notes", {})
+        if notes:
+            _render_reflection_section(notes)
+
         final = state.get("final_response", "")
         if final:
             st.info(f"**Summary:** {final}")
 
-        rankings = state.get("candidate_rankings", [])
-        if rankings:
-            st.markdown(
-                f"**{len(rankings)} candidate(s) ranked.** Click *Schedule Interview* "
-                "on any row to jump to Interview Scheduling."
-            )
-            _display_rankings(rankings)
-        else:
-            _empty_state(
-                "🎯",
-                "No candidates ranked yet",
-                "Run Screen & Rank Candidates to populate the ranking table.",
-            )
-        _render_reflection_summary(state.get("reflection_notes", {}))
-        _display_interview_slots(state.get("interview_slots", []))
         errors = state.get("error", "")
         if errors:
             st.error(f"Pipeline error: {errors}")
+
+        # Show paused state if the session was interrupted mid-pipeline
+        paused_node = st.session_state.get("paused_at_node")
+        if paused_node:
+            _show_paused_state(paused_node, st.session_state.get("paused_error", ""))
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────
@@ -1055,13 +1357,61 @@ with st.sidebar:
 
     st.divider()
 
+    st.markdown("#### Model Provider")
+    _provider = st.segmented_control(
+        "Provider",
+        options=["Ollama", "Gemini"],
+        key="llm_provider",
+        label_visibility="collapsed",
+    )
+
     _llm_ok = _check_llm()
-    _provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
-    if _llm_ok:
-        st.success(f"{_provider.title()} ready", icon="✅")
+
+    if _provider == "Ollama":
+        if _llm_ok:
+            st.success("Ollama connected", icon="✅")
+        else:
+            st.error("Ollama is not reachable", icon="❌")
+            st.caption("Start Ollama with `ollama serve` before continuing.")
     else:
-        st.error(f"{_provider.title()} is not ready", icon="❌")
-        st.caption("Set provider settings in .env; for local Ollama, start `ollama serve`.")
+        _key = st.text_input(
+            "Gemini API key",
+            type="password",
+            value=st.session_state.gemini_api_key,
+            placeholder="Paste your Gemini API key…",
+            key="gemini_key_input",
+            label_visibility="collapsed",
+        )
+        if _key != st.session_state.gemini_api_key:
+            st.session_state.gemini_api_key = _key
+
+        if _key.strip():
+            if st.button(
+                "Save & Connect",
+                use_container_width=True,
+                key="gemini_connect_btn",
+            ):
+                with st.spinner("Validating Gemini API key…"):
+                    try:
+                        from langchain_google_genai import ChatGoogleGenerativeAI
+
+                        _test_llm = ChatGoogleGenerativeAI(
+                            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                            google_api_key=_key.strip(),
+                            temperature=0,
+                        )
+                        _test_llm.invoke("ping")
+                        st.success("Gemini connected", icon="✅")
+                        st.session_state.gemini_connected = True
+                    except (ValueError, RuntimeError, KeyError) as exc:
+                        st.error(f"Gemini connection failed: {exc}", icon="❌")
+                        st.session_state.gemini_connected = False
+            elif st.session_state.get("gemini_connected"):
+                st.success("Gemini connected", icon="✅")
+            else:
+                st.warning("Enter your API key and click Save & Connect.", icon="⚠️")
+        else:
+            st.caption("Enter your Gemini API key to enable cloud inference.")
 
     st.divider()
 

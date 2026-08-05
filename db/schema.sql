@@ -66,7 +66,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,             -- = LangGraph thread_id
     mode TEXT,                       -- 'recruiter' | 'candidate'
     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_active_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    last_active_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    paused_at_node TEXT,             -- node name where a transient error occurred
+    error_message TEXT               -- human-readable error description
 );
 
 -- HR Assistant answers (HRAssistantAgent output)
