@@ -12,13 +12,14 @@ SmartHire AI orchestrates a team of specialized AI agents to automate the end-to
 - [Tech Stack](#tech-stack)
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
-- [Project Layout](#project-layout)
 - [How It Works](#how-it-works)
 - [Agents](#agents)
 - [Tools](#tools)
 - [LangGraph Memory](#langgraph-memory)
 - [LLM Provider Configuration](#llm-provider-configuration)
 - [Frontend](#frontend)
+- [Outputs](#outputs)
+- [Performance](#performance)
 - [Testing](#testing)
 - [Development](#development)
 
@@ -68,61 +69,7 @@ SmartHire AI orchestrates a team of specialized AI agents to automate the end-to
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Streamlit Frontend                          │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────┐ ┌───────────┐  │
-│  │  Resume      │ │  Candidate   │ │ Interview│ │  Chat     │  │
-│  │  Screening   │ │  Matching    │ │ Scheduling│ │           │  │
-│  └──────┬───────┘ └──────┬───────┘ └────┬─────┘ └─────┬─────┘  │
-│         └────────────────┼──────────────┼──────────────┘        │
-│                    ┌─────┴─────┐         │                      │
-│                    │  System   │         │                      │
-│                    │  Insight  │         │                      │
-│                    └───────────┘         │                      │
-└─────────┼────────────────┼──────────────┼──────────────────────┘
-          │                │              │
-          ▼                ▼              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      graph.py                                   │
-│              LangGraph StateGraph Orchestration                 │
-│                                                                 │
-│  START → Supervisor ──┬──→ Resume Screening ──┐                 │
-│                       ├──→ Candidate Matching ─┤                 │
-│                       ├──→ Interview Scheduling─┤                 │
-│                       └──→ HR Assistant ───────┘                 │
-│                              │                                   │
-│                              ▼                                   │
-│                      Memory Update                               │
-│                              │                                   │
-│                              ▼                                   │
-│                      Reflection Node ──→ END                     │
-│                         (retry loop)                             │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   db/smarthire.db                               │
-│  ┌────────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐ │
-│  │ job_desc.  │ │candidates│ │rankings  │ │interviews        │ │
-│  │ screenings │ │sessions  │ │hr_answers│ │chat_messages     │ │
-│  │uploads     │ │          │ │          │ │                  │ │
-│  └────────────┘ └──────────┘ └──────────┘ └──────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Routing Logic
-
-The Supervisor classifies user intent and routes to specialist agents. Recruiter buttons take a **direct route** (the `requested_workflow` in state — `screening` or `matching`) so Screening and Matching run without spending an LLM call on intent classification:
-
-| Intent | Trigger Examples | Agent(s) Invoked |
-|--------|-----------------|-------------------|
-| Resume screening | "review this resume", file upload, "parse this CV" | Resume Screening → Candidate Matching (if JD present) |
-| Candidate ranking | "rank candidates", "who's the best fit", "compare applicants" | Candidate Matching |
-| Interview scheduling | "schedule interview", "find available slots", "book a time" | Interview Scheduling |
-| HR question | "what's your policy on", "how does the process work" | HR Assistant |
-| Multi-intent | "screen resumes AND schedule interviews" | Multiple agents in sequence |
-| Greeting/filler | "hello", "thanks", "okay" | HR Assistant (conversational) |
+![SmartHire AI Architecture](outputs_results/architecture.png)
 
 ### Reflection Node — Validation Checklist
 
@@ -218,68 +165,6 @@ GEMINI_MODEL=gemini-2.5-flash
 ### App Output
 
 The app opens at `http://localhost:8501`. The SQLite schema (`db/smarthire.db`) is created automatically on first run and is idempotent (`CREATE TABLE IF NOT EXISTS`). No manual database setup is required.
-
----
-
-## Project Layout
-
-```
-smarthire-ai/
-├── app.py                          # Streamlit frontend (recruiter dashboard + candidate chat)
-├── graph.py                        # LangGraph StateGraph orchestration + checkpointer wiring
-├── supervisor.py                   # Intent detection / agent routing
-│
-├── agents/
-│   ├── resume_screening_agent.py   # Async-parallel resume parsing + initial match scoring
-│   ├── candidate_matching_agent.py # Ranks candidates against JD with justified scores
-│   ├── interview_scheduler_agent.py# Proposes/manages interview slots, conflict detection
-│   ├── hr_assistant_agent.py       # Role-aware HR FAQs, escalation for sensitive topics
-│   └── reflection_node.py          # 4-point validation checklist, correction retry loop
-│
-├── tools/
-│   ├── resume_parser.py            # LLM-based structured resume extraction (PDF/DOCX/TXT)
-│   ├── jd_analyzer.py              # LLM-based JD requirement extraction
-│   ├── calendar_tool.py            # Interview scheduling, conflict detection, slot booking
-│   ├── skill_normalizer.py         # Skill name normalization, alias resolution, text extraction
-│   ├── candidate_database.py       # SQLite-based candidate read/query layer
-│   └── email_notification.py       # Log-based email stub (interview invites, status updates)
-│
-├── memory/
-│   ├── state.py                    # SmartHireState TypedDict — shared graph state schema
-│   ├── conversation_memory.py      # ConversationMemory — session lifecycle + SqliteSaver checkpointer
-│   └── chat_audit.py               # ChatAudit — human-readable conversation transcript + session mirror
-│
-├── db/
-│   ├── database.py                 # SQLite connection manager + typed persistence helpers
-│   ├── schema.sql                  # DDL for all 9 recruitment tables + indexes
-│   └── smarthire.db                # Generated at runtime (gitignored)
-│
-├── utils/
-│   ├── models.py                   # Pydantic v2 input/output models for all agents
-│   ├── llm_factory.py              # LLM provider factory (Ollama / Gemini)
-│   └── observability.py            # Dependency-free execution logging decorators
-│
-├── knowledge/
-│   └── recruitment.json            # HR knowledge base topics (candidate + recruiter)
-│
-├── prompts/
-│   └── hr_knowledge_base.md        # Legacy markdown knowledge base (backward compatible)
-│
-├── data/
-│   ├── interview_slots.json        # CalendarTool JSON-backed slot store
-│   └── active_session.local        # ChatAudit session-id mirror for refresh recovery
-│
-├── tests/                          # pytest suite (14 test files)
-├── docs/
-│   └── architecture.md             # Full multi-agent design docs
-│
-├── .streamlit/config.toml          # Streamlit theme (enterprise teal) + server settings
-├── .env.example                    # LLM provider template
-├── .gitignore                      # SQLite DB, .env, __pycache__, .venv
-├── pyproject.toml                  # Project metadata + dependencies (source of truth)
-├── uv.lock                         # Locked dependency versions
-└── requirements.txt                # pip-compatible copy (kept in sync)
-```
 
 ---
 
@@ -500,6 +385,47 @@ A separate mode for candidates to ask HR questions about the recruitment process
 
 ---
 
+## Outputs
+
+Sample results from the app, shown in the `outputs_results/` directory.
+
+### Recruiter Dashboard
+
+**Resume Screening**
+
+![Resume Screening](outputs_results/resume_screening.png)
+
+**Candidate Matching**
+
+![Candidate Matching](outputs_results/candidate_matching.png)
+
+**Interview Scheduling**
+
+![Interview Scheduling](outputs_results/interview_scheduling.png)
+
+**Recruiter Chat**
+
+![Recruiter Chat](outputs_results/recruiter_chat.png)
+
+### Candidate Chat
+
+**Candidate Chat**
+
+![Candidate Chat](outputs_results/candidate_chat.png)
+
+---
+
+## Performance
+
+End-to-end timings measured with a batch of **2 resumes**. Exact times depend on hardware, model size, and prompt lengths.
+
+| Stage | Ollama (Llama 3.2) | Gemini |
+|-------|--------------------|--------|
+| Resume Screening | 5–6 minutes | 2–3 minutes |
+| Candidate Matching | 2–3 minutes | 1–2 minutes |
+
+---
+
 ## Testing
 
 **With uv:**
@@ -519,25 +445,6 @@ pytest -v                  # verbose output
 pytest tests/test_skill_normalizer.py   # specific file
 ruff check .               # lint
 ```
-
-### Test Files
-
-| File | Covers |
-|------|--------|
-| `test_resume_parser.py` | Resume text extraction, structured field extraction |
-| `test_resume_screening_agent.py` | Screening pipeline, match scoring |
-| `test_jd_analyzer.py` | JD requirement extraction |
-| `test_candidate_matching_agent.py` | Candidate ranking, composite scoring |
-| `test_interview_scheduler_agent.py` | Slot proposal, conflict detection |
-| `test_calendar_tool.py` | Availability checks, booking |
-| `test_candidate_database.py` | SQLite candidate queries |
-| `test_email_notification.py` | Email stub logging |
-| `test_chat_audit.py` | Conversation transcript persistence |
-| `test_reflection_node.py` | Validation checklist, retry logic |
-| `test_skill_normalizer.py` | Skill normalization, alias resolution |
-| `test_memory.py` | Session lifecycle, ConversationMemory |
-| `test_graph.py` | LangGraph orchestration, routing |
-| `test_hr_assistant_agent.py` | HR Q&A, escalation |
 
 ---
 
@@ -596,13 +503,4 @@ python tools/jd_analyzer.py path/to/job_description.txt
 **With pip:** `python graph.py`
 
 Runs a full pipeline with a sample HR question against the real LLM.
-
-### Code Style
-
-- Linting: **Ruff**
-  - With uv: `uv run ruff check .`
-  - With pip: `ruff check .`
-- Type hints: Python 3.11+ syntax (`str | None`, `list[str]`)
-- Models: Pydantic v2 with explicit field descriptions
-- No comments unless requested
 
