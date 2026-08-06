@@ -308,12 +308,23 @@ def build_graph(
                 jd_analysis_task=jd_task,
             )
             analyzed = {}
+            jd_analysis_status = (
+                "not_parsed"
+                if not jd_data.get("raw_text")
+                else "already_parsed" if jd_data.get("required_skills") else "pending"
+            )
             if jd_task is not None:
                 try:
                     analyzed = await jd_task
+                    jd_analysis_status = (
+                        "ok"
+                        if analyzed.get("required_skills") or analyzed.get("job_title")
+                        else "no_data"
+                    )
                 except Exception:
                     logger.exception("JD analysis failed; keeping raw JD")
-            return results, {**jd_data, **analyzed}
+                    jd_analysis_status = "error"
+            return results, {**jd_data, **analyzed, "jd_analysis_status": jd_analysis_status}
 
         batch_results, jd_data = asyncio.run(run_screening_batch())
         screened, failures = [], []

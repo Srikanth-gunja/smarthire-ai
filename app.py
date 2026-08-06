@@ -562,8 +562,34 @@ def _retry_screening(filename: str) -> None:
     st.rerun()
 
 
+def _render_jd_status(jd_data: dict) -> None:
+    """Render a clear status label for the job description used in screening.
+
+    The label reflects whether the JD was successfully parsed into structured
+    requirements, failed to parse, or yielded no usable data — instead of
+    silently falling back to raw text.
+    """
+    status = jd_data.get("jd_analysis_status", "unknown")
+    title = jd_data.get("title") or jd_data.get("job_title") or "Uploaded job description"
+    if status in ("ok", "already_parsed"):
+        st.success(f"📝 Job description ready: **{title}**")
+    elif status in ("error", "no_data"):
+        st.warning(
+            "📝 Job description could not be parsed into structured "
+            f"requirements (**{title}**). Candidates were still scored against "
+            "the raw JD text, but skill/experience matching may be less precise."
+        )
+    elif status == "not_parsed":
+        st.warning(
+            "📝 No job description text was extracted. Candidates were screened "
+            "without requirement parsing."
+        )
+    else:
+        st.info(f"📝 Job description: **{title}**")
+
+
 def _render_resume_screening_section(
-    resumes: list[dict], failures: list[dict] | None = None
+    resumes: list[dict], failures: list[dict] | None = None, jd_data: dict | None = None
 ) -> None:
     """Render Resume Screening results with a per-candidate detail view.
 
@@ -581,6 +607,8 @@ def _render_resume_screening_section(
         f"{total} resume(s) screened. Select a candidate below to view details."
         f"{failure_note}"
     )
+    if jd_data:
+        _render_jd_status(jd_data)
 
     if not resumes and not failures:
         _empty_state("📄", "No resumes screened", "Upload resumes to begin.")
@@ -1721,7 +1749,9 @@ def _render_upload_tab() -> None:
         resumes = state.get("resumes", [])
         failures = state.get("screening_failures", [])
         if resumes or failures:
-            _render_resume_screening_section(resumes, failures)
+            _render_resume_screening_section(
+                resumes, failures, state.get("job_description")
+            )
             st.info("Screening is complete. Open **Candidate Matching** to compare and rank this batch.")
 
         errors = state.get("error", "")
@@ -1763,7 +1793,7 @@ def _render_matching_tab() -> None:
         return
 
     st.success(f"Ready to compare {len(resumes)} screened candidate(s).")
-    st.caption(f"Job description: {jd_data.get('title') or 'Uploaded job description'}")
+    _render_jd_status(jd_data)
 
     if st.button("🚀 Rank Screened Candidates", type="primary", use_container_width=True):
         if not _llm_ok:
