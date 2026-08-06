@@ -223,39 +223,6 @@ def _restore_state(session_id: str) -> SmartHireState:
     return SmartHireState(conversation_history=[])
 
 
-def _load_past_session(session_id: str) -> None:
-    """Switch the app to a previously saved session (chat + ranking results).
-
-    Restores the human-readable transcripts (per recruiter/candidate mode)
-    from ``chat_messages`` and the agent outputs (rankings, slots, final
-    response) from the LangGraph checkpointer, then reruns so the chosen
-    session is rendered.
-    """
-    audit = ChatAudit()
-    st.session_state.session_id = session_id
-    audit.save_session_id(session_id)
-    row = Database().fetch_one(
-        "SELECT mode FROM sessions WHERE id = ?", (session_id,)
-    )
-    mode = "candidate" if row and row["mode"] == "candidate" else "recruiter"
-    st.session_state.chats = _load_all_chats(session_id, audit)
-    st.session_state.graph_state = _restore_state(session_id)
-    _clear_upload_widget_state()
-    _restore_session_uploads(session_id)
-    st.session_state.show_results = True
-    st.session_state.mode_picker = (
-        "Candidate" if mode == "candidate" else "Recruiter"
-    )
-    # Restore paused state if the session was interrupted mid-pipeline
-    paused = Database().get_session_paused(session_id)
-    if paused:
-        st.session_state.paused_at_node = paused["paused_at_node"]
-        st.session_state.paused_error = paused["error_message"]
-    else:
-        st.session_state.pop("paused_at_node", None)
-        st.session_state.pop("paused_error", None)
-
-
 def _restore_session_uploads(session_id: str) -> None:
     """Restore retained source documents so Screening stays usable per session."""
     resumes: list[dict] = []
@@ -344,47 +311,15 @@ def _reset_current_session() -> None:
     st.session_state.recruiter_tab = "Resume Screening"
     st.session_state.pop("paused_at_node", None)
     st.session_state.pop("paused_error", None)
-    audit.save_session_id(session_id)
-
-
-def _clear_all_sessions() -> None:
-    """Remove every saved session, upload, workflow result, and chat record."""
-    ChatAudit().clear_session_id()
-    ConversationMemory().clear_all_sessions()
-    _start_new_session()
-    st.session_state.flash = "All saved sessions and their uploaded files were cleared."
-
-
-def _start_new_session() -> None:
-    """Create an explicitly requested blank session and switch to it."""
-    audit = ChatAudit()
-    mode = "candidate" if st.session_state.mode_picker == "Candidate" else "recruiter"
-    session_id = ConversationMemory().create_session(mode)
-    st.session_state.session_id = session_id
-    audit.save_session_id(session_id)
-    _clear_upload_widget_state()
-    st.session_state.chats = {"candidate": [], "recruiter": []}
-    st.session_state.graph_state = SmartHireState(conversation_history=[])
-    st.session_state.resume_texts = []
-    st.session_state.jd_data = None
-    st.session_state.show_results = False
-    st.session_state.sched = None
-    st.session_state.recruiter_tab = "Resume Screening"
-    st.session_state.pop("paused_at_node", None)
-    st.session_state.pop("paused_error", None)
 
 
 # ── Session init ──────────────────────────────────────────────────────
 
 if "session_id" not in st.session_state:
-    audit = ChatAudit()
-    # Resume the mirrored session id, else the most recent persisted session,
-    # else start fresh — so conversation survives browser refreshes.
-    sid = audit.restore_session_id() or ConversationMemory().resume_last_session()
-    if not sid:
-        sid = ConversationMemory().create_session()
-    audit.save_session_id(sid)
-    st.session_state.session_id = sid
+    # Every browser gets its own private thread. Nothing is restored from a
+    # shared file or a global "most recent session", so multiple members on
+    # the same URL never see each other's data.
+    st.session_state.session_id = ConversationMemory().create_session()
 if "graph_state" not in st.session_state:
     st.session_state.graph_state = _restore_state(st.session_state.session_id)
 if "chats" not in st.session_state:
@@ -571,11 +506,13 @@ def _run_resume_with_progress() -> None:
 # ── Incremental pipeline rendering ────────────────────────────────────
 
 
-def _iter_pipeline_updates(user_input: str):
+def _iter_pipeline_updates(user_input: str, screening_progress_cb=None):
     """Stream the graph yielding (node_name, state_update) per node.
 
     Uses ``stream_mode="updates"`` so each completed node's output is
-    available immediately for incremental rendering.
+    available immediately for incremental rendering.  ``screening_progress_cb``
+    is forwarded to the Resume Screening node and fires as each resume finishes
+    so the UI can render progressive results live.
     """
     from graph import run_smarthire_stream_updates
 
@@ -584,21 +521,108 @@ def _iter_pipeline_updates(user_input: str):
         user_input=user_input,
         state=state,
         session_id=st.session_state.session_id,
+        screening_progress_cb=screening_progress_cb,
     )
 
 
-def _render_resume_screening_section(resumes: list[dict]) -> None:
-    """Render Resume Screening results with a per-candidate detail view."""
+def _retry_screening(filename: str) -> None:
+    """Button callback: re-screen a single failed resume, then rerun.
+
+    Runs one standalone async screening for the failed document, moves it out
+    of ``screening_failures`` (and into ``resumes`` on success), persists the
+    corrected state, and reruns so the dropdown reflects the retry.
+    """
+    if not filename:
+        st.warning("Cannot retry: the resume file name is unknown.")
+        return
+    from graph import persist_graph_state, rescreen_single_resume
+
+    with st.spinner(f"Re-screening {filename}…"):
+        result, error = rescreen_single_resume(
+            st.session_state.session_id, filename
+        )
+
+    state = dict(st.session_state.graph_state)
+    state.setdefault("resumes", [])
+    state.setdefault("screening_failures", [])
+    state["screening_failures"] = [
+        f for f in state["screening_failures"] if f.get("filename") != filename
+    ]
+    if result is not None:
+        state["resumes"].append(result)
+    else:
+        state["screening_failures"].append({
+            "candidate_name": filename or "Unknown resume",
+            "screening_status": "failed",
+            "error": error or "Screening failed",
+            "filename": filename,
+        })
+    st.session_state.graph_state = state
+    persist_graph_state(st.session_state.session_id, dict(state))
+    st.rerun()
+
+
+def _render_jd_status(jd_data: dict) -> None:
+    """Render a clear status label for the job description used in screening.
+
+    The label reflects whether the JD was successfully parsed into structured
+    requirements, failed to parse, or yielded no usable data — instead of
+    silently falling back to raw text.
+    """
+    status = jd_data.get("jd_analysis_status", "unknown")
+    title = jd_data.get("title") or jd_data.get("job_title") or "Uploaded job description"
+    if status in ("ok", "already_parsed"):
+        st.success(f"📝 Job description ready: **{title}**")
+    elif status in ("error", "no_data"):
+        st.warning(
+            "📝 Job description could not be parsed into structured "
+            f"requirements (**{title}**). Candidates were still scored against "
+            "the raw JD text, but skill/experience matching may be less precise."
+        )
+    elif status == "not_parsed":
+        st.warning(
+            "📝 No job description text was extracted. Candidates were screened "
+            "without requirement parsing."
+        )
+    else:
+        st.info(f"📝 Job description: **{title}**")
+
+
+def _render_resume_screening_section(
+    resumes: list[dict], failures: list[dict] | None = None, jd_data: dict | None = None
+) -> None:
+    """Render Resume Screening results with a per-candidate detail view.
+
+    Failed documents stay visible inline in the dropdown with a red
+    "Screening failed — retry" state and their own retry button — they are
+    never silently dropped from the batch.
+    """
+    failures = failures or []
+    total = len(resumes) + len(failures)
     st.markdown("### 📄 Resume Screening Results")
-    st.caption(
-        f"{len(resumes)} resume(s) screened. Select a candidate below to view details."
+    failure_note = (
+        f" {len(failures)} failed and need attention." if failures else ""
     )
+    st.caption(
+        f"{total} resume(s) screened. Select a candidate below to view details."
+        f"{failure_note}"
+    )
+    if jd_data:
+        _render_jd_status(jd_data)
 
-    if not resumes:
+    if not resumes and not failures:
         _empty_state("📄", "No resumes screened", "Upload resumes to begin.")
         return
 
-    names = [r.get("candidate_name", f"Candidate {i + 1}") for i, r in enumerate(resumes)]
+    # Dropdown = successful candidates first, then inline failed entries.
+    options: list[tuple[str, dict, bool]] = []
+    for r in resumes:
+        options.append((r.get("candidate_name", f"Candidate {len(options) + 1}"), r, False))
+    for f in failures:
+        label = f.get("filename") or f.get("candidate_name") or "Unknown resume"
+        options.append((f"{label} — Screening failed", f, True))
+
+    names = [o[0] for o in options]
     selected = st.selectbox(
         "Select candidate",
         names,
@@ -606,12 +630,28 @@ def _render_resume_screening_section(resumes: list[dict]) -> None:
         label_visibility="collapsed",
     )
     idx = names.index(selected) if selected in names else 0
-    detail = resumes[idx]
+    entry, is_failed = options[idx][1], options[idx][2]
+
+    if is_failed:
+        with st.container(border=True):
+            st.markdown("#### 🔴 Screening failed")
+            st.error(entry.get("error", "Screening failed"))
+            st.caption(
+                "This resume could not be screened. Fix the file or retry the "
+                "screening for just this resume — the rest of the batch is unaffected."
+            )
+            if st.button(
+                "🔁 Retry screening",
+                key=f"retry_screening_{entry.get('filename', idx)}",
+                use_container_width=True,
+            ):
+                _retry_screening(entry.get("filename"))
+        return
 
     with st.container(border=True):
-        st.markdown(f"#### {detail.get('candidate_name', 'Unknown')}")
+        st.markdown(f"#### {entry.get('candidate_name', 'Unknown')}")
 
-        skills = detail.get("skills", [])
+        skills = entry.get("skills", [])
         if skills:
             st.markdown("**Skills:**")
             skill_tags = " ".join(
@@ -622,7 +662,7 @@ def _render_resume_screening_section(resumes: list[dict]) -> None:
             )
             st.markdown(skill_tags, unsafe_allow_html=True)
 
-        education = detail.get("education", [])
+        education = entry.get("education", [])
         if education:
             st.markdown("**Education:**")
             for edu in education:
@@ -632,12 +672,12 @@ def _render_resume_screening_section(resumes: list[dict]) -> None:
                     year = edu.get("year", "")
                     st.caption(f"• {degree} — {inst} ({year})" if year else f"• {degree} — {inst}")
 
-        summary = detail.get("summary", "")
+        summary = entry.get("summary", "")
         if summary:
             st.markdown("**Screening Summary:**")
             st.info(summary)
 
-        extracted = detail.get("extracted_fields", {})
+        extracted = entry.get("extracted_fields", {})
         certs = extracted.get("certifications", [])
         roles = extracted.get("past_roles", [])
         if certs:
@@ -674,6 +714,39 @@ def _render_reflection_section(notes: dict) -> None:
 # ── Staged pipeline runner ────────────────────────────────────────────
 
 
+def _render_screening_live(placeholder, entries: list[dict], total: int) -> None:
+    """Live, mid-run progress view of a screening batch.
+
+    Streamlit renders this placeholder repeatedly as each resume finishes, so
+    the recruiter sees a growing dropdown (successes + failures) and a live
+    "Screening X of Y resumes…" count instead of one spinner for the whole
+    stage.  It is read-only — the interactive per-candidate detail view
+    renders after the pipeline completes.
+    """
+    placeholder.empty()
+    done = len(entries)
+    with placeholder.container():
+        names: list[str] = []
+        for entry in entries:
+            if entry.get("screening_status") == "failed":
+                label = entry.get("filename") or entry.get("candidate_name") or "Unknown resume"
+                names.append(f"🔴 {label} — Screening failed")
+            else:
+                score = entry.get("match_score")
+                pct = f" — {score:.0f}% match" if isinstance(score, (int, float)) else ""
+                names.append(f"🟢 {entry.get('candidate_name') or 'Unknown'}{pct}")
+        if names:
+            st.selectbox(
+                "Screened so far",
+                names,
+                key="screening_live_select",
+                label_visibility="collapsed",
+            )
+        remaining = total - done
+        if remaining:
+            st.caption(f"{remaining} resume(s) still screening…")
+
+
 def _run_with_progress(progress_title: str) -> None:
     """Run the pipeline with incremental rendering of each agent's results.
 
@@ -681,6 +754,11 @@ def _run_with_progress(progress_title: str) -> None:
     completes, its output is stored in ``st.session_state.graph_state`` and
     rendered immediately below the progress indicator — so Resume Screening
     results appear before Candidate Matching starts.
+
+    While the Resume Screening node fans out in parallel, the screening
+    progress callback updates the status area live ("Screening 4 of 7
+    resumes…") and repopulates the results dropdown as each resume finishes,
+    instead of showing one spinner for the whole stage.
     """
     from graph import TransientError
 
@@ -692,8 +770,36 @@ def _run_with_progress(progress_title: str) -> None:
         with st.status(progress_title, expanded=True) as status:
             status.update(label="Starting agents…", state="running")
             progress_ph = st.empty()
+            screening_ph = st.empty()
 
-            for node_name, update in _iter_pipeline_updates(st.session_state.pending_input):
+            def _on_screening_progress(done, total, name, result, error):
+                progress_ph.markdown(
+                    f"**Screening {done} of {total} resumes…**",
+                    unsafe_allow_html=True,
+                )
+                if result is None and error is None:
+                    return
+                live = list(st.session_state.get("screening_live", []))
+                if result is not None:
+                    live.append(
+                        result.model_dump()
+                        if hasattr(result, "model_dump")
+                        else result
+                    )
+                else:
+                    live.append({
+                        "candidate_name": name or "Unknown resume",
+                        "screening_status": "failed",
+                        "error": str(error),
+                        "filename": name,
+                    })
+                st.session_state["screening_live"] = live
+                _render_screening_live(screening_ph, live, total)
+
+            for node_name, update in _iter_pipeline_updates(
+                st.session_state.pending_input,
+                screening_progress_cb=_on_screening_progress,
+            ):
                 # Mark this node as completed
                 if node_name not in completed:
                     completed.append(node_name)
@@ -723,12 +829,16 @@ def _run_with_progress(progress_title: str) -> None:
 
             status.update(label="✓ Pipeline complete", state="complete", expanded=False)
             progress_ph.markdown(_stage_checklist(completed, None, workflow), unsafe_allow_html=True)
+            screening_ph.empty()
+            st.session_state.pop("screening_live", None)
 
     except TransientError as exc:
         st.session_state.graph_state = _restore_state(st.session_state.session_id)
+        st.session_state.pop("screening_live", None)
         _show_paused_state(exc.node_name, exc.message)
         return
     except (ValueError, RuntimeError, KeyError) as exc:
+        st.session_state.pop("screening_live", None)
         msg = str(exc)
         if "api_key" in msg.lower() or "auth" in msg.lower() or "permission" in msg.lower():
             st.error(f"Gemini authentication failed: {msg}")
@@ -750,8 +860,9 @@ def _render_stage(node_name: str, state: dict) -> None:
     """Render the output section for a completed pipeline stage."""
     if node_name == "resume_screening":
         resumes = state.get("resumes", [])
-        if resumes:
-            _render_resume_screening_section(resumes)
+        failures = state.get("screening_failures", [])
+        if resumes or failures:
+            _render_resume_screening_section(resumes, failures)
             st.divider()
     elif node_name == "candidate_matching":
         rankings = state.get("candidate_rankings", [])
@@ -1103,6 +1214,7 @@ def _propose_slots(candidate: str, date: str, interviewer: str) -> list[dict]:
     slot conflicts only when it overlaps an existing booking.
     """
     calendar = CalendarTool()
+    calendar.purge_past_bookings()
     hours = [
         ("09:00", "10:00"),
         ("10:00", "11:00"),
@@ -1616,6 +1728,7 @@ def _render_upload_tab() -> None:
                 # A new screening run creates a new source snapshot.  Existing
                 # rankings must not appear to belong to it.
                 "candidate_rankings": [],
+                "screening_failures": [],
                 "reflection_notes": {},
                 "final_response": "",
                 "reflection_attempts": 0,
@@ -1634,8 +1747,11 @@ def _render_upload_tab() -> None:
 
         # Screening results stay in this workflow. Ranking has its own tab.
         resumes = state.get("resumes", [])
-        if resumes:
-            _render_resume_screening_section(resumes)
+        failures = state.get("screening_failures", [])
+        if resumes or failures:
+            _render_resume_screening_section(
+                resumes, failures, state.get("job_description")
+            )
             st.info("Screening is complete. Open **Candidate Matching** to compare and rank this batch.")
 
         errors = state.get("error", "")
@@ -1667,8 +1783,17 @@ def _render_matching_tab() -> None:
         )
         return
 
+    failures = state.get("screening_failures", [])
+    if failures:
+        _empty_state(
+            "⚠️",
+            "Finish resume screening first",
+            f"{len(failures)} resume(s) failed screening. Resolve them and run screening again before matching.",
+        )
+        return
+
     st.success(f"Ready to compare {len(resumes)} screened candidate(s).")
-    st.caption(f"Job description: {jd_data.get('title') or 'Uploaded job description'}")
+    _render_jd_status(jd_data)
 
     if st.button("🚀 Rank Screened Candidates", type="primary", use_container_width=True):
         if not _llm_ok:
@@ -1730,41 +1855,6 @@ with st.sidebar:
 
     st.divider()
 
-    with st.expander("Past Sessions"):
-        sessions = Database().get_sessions()
-        if not sessions:
-            st.caption("No past sessions yet.")
-        # Fixed order by original creation time (started_at), so loading a
-        # session never re-sorts it to the top.
-        sessions = sorted(
-            sessions,
-            key=lambda s: str(s["started_at"] or ""),
-            reverse=True,
-        )
-        for s in sessions:
-            sid = s["id"]
-            mode_name = s["mode"].capitalize() if s["mode"] else "Unknown"
-            timestamp = str(s["started_at"])[:16]
-            label = f"{mode_name} · {timestamp} · {sid[:8]}"
-            if sid == st.session_state.session_id:
-                st.markdown(
-                    f"<div style='background:#ECFDF5;border:1px solid #22C55E;"
-                    f"border-radius:8px;padding:8px 10px;margin-bottom:6px'>"
-                    f"<span style='color:#16A34A;font-weight:700'>● {label} — "
-                    f"active</span></div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.button(
-                    label,
-                    key=f"past_session_{sid}",
-                    use_container_width=True,
-                    on_click=_load_past_session,
-                    args=(sid,),
-                )
-
-    st.divider()
-
     st.markdown("#### Model Provider")
     _provider = st.segmented_control(
         "Provider",
@@ -1823,16 +1913,8 @@ with st.sidebar:
 
     st.divider()
 
-    if st.button("New Session", type="primary", use_container_width=True):
-        _start_new_session()
-        st.rerun()
-
     if st.button("Clear Current Session", type="secondary", use_container_width=True):
         _reset_current_session()
-        st.rerun()
-
-    if st.button("Clear All Sessions", type="secondary", use_container_width=True):
-        _clear_all_sessions()
         st.rerun()
 
 

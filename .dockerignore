@@ -1,0 +1,15 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+db/*.db
+db/*.db-wal
+db/*.db-shm
+db/*.db-journal
+data/*.local
+.test_tmp_observability/
+.test_tmp_parser/
+pytest-cache-files-*/

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from utils.models import InterviewSlot
@@ -229,6 +230,24 @@ class CalendarTool:
     def clear_all(self) -> None:
         """Clear all bookings from the store."""
         self._save_slots([])
+
+    def purge_past_bookings(self, today: str | None = None) -> int:
+        """Remove bookings for dates before today, keeping the store bounded.
+
+        Args:
+            today: ISO date string to compare against (None = today UTC).
+
+        Returns:
+            Number of bookings removed.
+        """
+        today = today or datetime.now(UTC).date().isoformat()
+        bookings = self._load_slots()
+        kept = [b for b in bookings if (b.get("date") or "") >= today]
+        removed = len(bookings) - len(kept)
+        if removed:
+            self._save_slots(kept)
+            logger.info("Purged %d past booking(s) from %s", removed, self.store_path)
+        return removed
 
 
 if __name__ == "__main__":

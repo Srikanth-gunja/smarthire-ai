@@ -18,6 +18,7 @@ routes to the next agent, or to memory_update when the queue is empty.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from time import perf_counter
 from typing import Any
@@ -182,6 +183,7 @@ def build_graph(
     session_id: str = "",
     llm: Any = None,
     checkpointer: Any = None,
+    screening_progress_cb: Any = None,
 ) -> Any:
     """Build and compile the LangGraph StateGraph for SmartHire AI.
 
@@ -200,6 +202,10 @@ def build_graph(
             ``session_id`` is set, the shared SQLite checkpointer
             (``SqliteSaver`` over ``db/smarthire.db``) is used so agent state
             survives Streamlit reruns and app restarts.
+        screening_progress_cb: Optional callback forwarded to the Resume
+            Screening agent's ``screen_batch_async`` so the UI can render each
+            resume's result live (progressive dropdown + count) instead of
+            waiting for the whole batch.
 
     Returns:
         A compiled StateGraph ready for invocation via ``.invoke()``.
@@ -272,47 +278,79 @@ def build_graph(
 
     def resume_screening_node(state: SmartHireState) -> dict:
         from tools.jd_analyzer import JDAnalyzer
-        from utils.models import ResumeScreeningInput
 
         history_msgs = state.get("conversation_history", [])
         jd_data = dict(state.get("job_description", {}))
-        # The UI stores the original JD immediately.  Extract its requirements
-        # here, at execution time, so all downstream agents score against the
-        # actual uploaded/pasted role rather than placeholder metadata.
-        if jd_data.get("raw_text") and not jd_data.get("required_skills"):
-            extracted_jd = JDAnalyzer(resume_screening_agent.llm).analyze(
-                jd_data["raw_text"]
-            )
-            jd_data = {**jd_data, **extracted_jd}
-
         resume_inputs = state.get("resume_inputs", [])
         # Backward-compatible single-document flow for chat/API callers.
         if not resume_inputs:
             resume_text = history_msgs[-1].content if history_msgs else ""
             resume_inputs = [{"name": None, "text": resume_text}]
 
-        screened = []
-        for resume in resume_inputs:
-            text = str(resume.get("text") or "").strip()
-            if not text:
-                continue
-            result = resume_screening_agent.screen_resume(
-                ResumeScreeningInput(resume_text=text, job_description=jd_data),
-                resume_filename=resume.get("name"),
+        # The UI stores the original JD immediately.  Extract its requirements
+        # here, at execution time, so all downstream agents score against the
+        # actual uploaded/pasted role rather than placeholder metadata.  The
+        # JD analysis runs as an asyncio task concurrently with the resume
+        # parses; each resume is scored only after both its parse and the JD
+        # task have resolved.
+        analyzer = JDAnalyzer(resume_screening_agent.llm)
+
+        async def run_screening_batch():
+            jd_task = None
+            if jd_data.get("raw_text") and not jd_data.get("required_skills"):
+                jd_task = asyncio.create_task(
+                    analyzer.analyze_async(jd_data["raw_text"])
+                )
+            results = await resume_screening_agent.screen_batch_async(
+                resume_inputs,
+                jd_data,
+                on_progress=screening_progress_cb,
+                jd_analysis_task=jd_task,
             )
-            screened.append(result.model_dump())
+            analyzed = {}
+            jd_analysis_status = (
+                "not_parsed"
+                if not jd_data.get("raw_text")
+                else "already_parsed" if jd_data.get("required_skills") else "pending"
+            )
+            if jd_task is not None:
+                try:
+                    analyzed = await jd_task
+                    jd_analysis_status = (
+                        "ok"
+                        if analyzed.get("required_skills") or analyzed.get("job_title")
+                        else "no_data"
+                    )
+                except Exception:
+                    logger.exception("JD analysis failed; keeping raw JD")
+                    jd_analysis_status = "error"
+            return results, {**jd_data, **analyzed, "jd_analysis_status": jd_analysis_status}
+
+        batch_results, jd_data = asyncio.run(run_screening_batch())
+        screened, failures = [], []
+        for resume, result in zip(resume_inputs, batch_results):
+            if isinstance(result, Exception):
+                failures.append({
+                    "candidate_name": resume.get("name") or "Unknown resume",
+                    "screening_status": "failed",
+                    "error": str(result),
+                    "filename": resume.get("name"),
+                })
+            else:
+                screened.append(result.model_dump())
 
         remaining = state.get("active_agents", [])[1:]
-        logger.info("ResumeScreening completed: %d resume(s)", len(screened))
+        logger.info("ResumeScreening completed: %d succeeded, %d failed", len(screened), len(failures))
 
         return {
             "resumes": screened,
+            "screening_failures": failures,
             "job_description": jd_data,
             "active_agents": remaining,
             "conversation_history": [
                 AIMessage(
                     content=(
-                        f"[ResumeScreening] Screened {len(screened)} resume(s) "
+                        f"[ResumeScreening] Screened {len(screened)} resume(s); {len(failures)} failed. "
                         f"against {jd_data.get('job_title') or 'the uploaded role'}."
                     )
                 ),
@@ -332,7 +370,7 @@ def build_graph(
             job_description=jd_data,
             reflection_feedback=state.get("reflection_feedback"),
         )
-        result = candidate_matching_agent.rank_candidates(input_data)
+        result = asyncio.run(candidate_matching_agent.rank_candidates_async(input_data))
 
         remaining = state.get("active_agents", [])[1:]
         logger.info(
@@ -616,7 +654,7 @@ def build_graph(
 # ── Public entrypoint ─────────────────────────────────────────────────
 
 
-def _build_components(session_id: str):
+def _build_components(session_id: str, screening_progress_cb: Any = None):
     """Create the LLM, agents, checkpointer, and compiled graph for a session."""
     from agents.candidate_matching_agent import CandidateMatchingAgent
     from agents.hr_assistant_agent import HRAssistantAgent
@@ -637,6 +675,7 @@ def _build_components(session_id: str):
     compiled = build_graph(
         sup, resume_agent, matching_agent, scheduler_agent, hr_agent,
         session_id=session_id, llm=llm, checkpointer=checkpointer,
+        screening_progress_cb=screening_progress_cb,
     )
     return compiled, checkpointer, get_thread_config(session_id)
 
@@ -761,18 +800,26 @@ def run_smarthire_stream_updates(
     user_input: str,
     state: SmartHireState | None = None,
     session_id: str | None = None,
+    screening_progress_cb=None,
 ):
     """Stream the pipeline yielding ``(node_name, state_update)`` per node.
 
     Uses ``stream_mode="updates"`` so each completed node's output dict is
     yielded immediately — enabling incremental rendering of results in the UI.
 
+    Args:
+        user_input: The raw user message.
+        state: Optional existing state to continue from.
+        session_id: Optional session id for memory persistence.
+        screening_progress_cb: Optional callback passed through to the Resume
+            Screening node for live per-resume progress rendering.
+
     Yields:
         Tuples of ``(node_name, state_update_dict)`` where state_update_dict
         contains the keys written by that node (e.g. ``{"resumes": [...]}``).
     """
     session_id = _resolve_session(session_id)
-    compiled, checkpointer, config = _build_components(session_id)
+    compiled, checkpointer, config = _build_components(session_id, screening_progress_cb)
     input_state = _prepare_input_state(user_input, state, checkpointer, config)
 
     for chunk in compiled.stream(input_state, config=config, stream_mode="updates"):
@@ -803,6 +850,94 @@ def resume_run(session_id: str):
         node_name = (event.get("payload") or {}).get("name")
         if event_type in ("task", "task_result") and node_name:
             yield event_type, node_name
+
+
+def persist_graph_state(session_id: str, values: dict) -> None:
+    """Best-effort write of a full channel-value dict to the session checkpoint.
+
+    Used after a standalone per-resume retry so the corrected screening
+    results survive app restarts (the same shape of checkpoint dict that
+    ``ConversationMemory._save`` writes, so it is safe for ``SqliteSaver``).
+    """
+    from memory.conversation_memory import get_checkpointer, get_thread_config
+
+    try:
+        saver = get_checkpointer()
+        config = get_thread_config(session_id)
+        current = saver.get_tuple(config)
+        if current is None:
+            return
+        old = current.checkpoint or {}
+        import uuid
+        from datetime import UTC, datetime
+
+        checkpoint = {
+            "v": old.get("v", 1),
+            "ts": datetime.now(UTC).isoformat(),
+            "id": str(uuid.uuid4()),
+            "channel_values": values,
+            "channel_versions": old.get("channel_versions", {}),
+            "versions_seen": old.get("versions_seen", {}),
+            "pending_writes": [],
+        }
+        saver.put(config, checkpoint, old.get("metadata", {}), {})
+    except Exception:
+        logger.exception("Failed to persist graph state for session %s", session_id)
+
+
+def rescreen_single_resume(session_id: str, filename: str):
+    """Re-screen one previously-failed resume against the session's job description.
+
+    Standalone retry used by the Resume Screening UI's per-resume "retry"
+    button.  It reuses the same async screening path as the batch fan-out so a
+    single document can be re-run without touching the other results.  Returns
+    a ``(result_dict, error_message)`` tuple.
+
+    Args:
+        session_id: The session whose JD + uploaded files are used.
+        filename: Original uploaded resume file name to retry.
+
+    Returns:
+        ``(screening_output_dict, None)`` on success or ``(None, error_message)``
+        on failure.
+    """
+    from agents.resume_screening_agent import ResumeScreeningAgent
+    from db.database import Database
+    from memory.conversation_memory import get_checkpointer, get_thread_config
+    from utils.llm_factory import get_llm
+    from utils.models import ResumeScreeningInput
+
+    checkpoint = get_checkpointer().get_tuple(get_thread_config(session_id))
+    values = dict((checkpoint.checkpoint or {}).get("channel_values") or {}) if checkpoint else {}
+    jd_data = values.get("job_description") or {}
+    if not jd_data.get("raw_text") and not jd_data.get("required_skills"):
+        return None, "Job description is not available for this session."
+
+    resume = next(
+        (
+            row
+            for row in Database().get_session_uploads(session_id)
+            if row["kind"] == "resume" and row["filename"] == filename
+        ),
+        None,
+    )
+    if resume is None:
+        return None, f"Uploaded resume '{filename}' was not found in this session."
+
+    agent = ResumeScreeningAgent(get_llm())
+    try:
+        output = asyncio.run(
+            agent.screen_resume_async(
+                ResumeScreeningInput(
+                    resume_text=resume["extracted_text"],
+                    job_description=jd_data,
+                ),
+                resume_filename=filename,
+            )
+        )
+        return output.model_dump(), None
+    except Exception as exc:  # noqa: BLE001 - surfaced to the UI for retry
+        return None, str(exc)
 
 
 def answer_candidate_query(

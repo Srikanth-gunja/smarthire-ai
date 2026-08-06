@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agents.resume_screening_agent import ResumeScreeningAgent, ScreeningResult
-from utils.models import ResumeScreeningInput
+from utils.models import ResumeScreeningInput, ResumeScreeningOutput
 
 
 @pytest.fixture
@@ -178,3 +180,203 @@ class TestScreeningResultModel:
                 candidate_name="Test", skills=[], experience_years=0,
                 education=[], summary="", match_score=101,
             )
+
+
+class TestScreenBatchAsync:
+    """Tests for the parallel batch fan-out (asyncio + semaphore)."""
+
+    @pytest.fixture
+    def sample_output(self):
+        """A fixed successful screening output for batch tests."""
+        return ResumeScreeningOutput(
+            candidate_name="Jane Doe",
+            skills=["Python", "React"],
+            experience_years=6.0,
+            education=[],
+            summary="Strong Python developer.",
+            match_score=80.0,
+            extracted_fields={"certifications": [], "past_roles": []},
+        )
+
+    @pytest.fixture
+    def parsed(self):
+        """A fixed parser result for batch tests."""
+        return {
+            "candidate_name": "Jane Doe",
+            "skills": ["Python", "React"],
+            "experience_years": 6.0,
+            "education": [],
+            "certifications": [],
+            "past_roles": [],
+        }
+
+    def _stub_parse_and_screen(self, agent, parsed, screen_impl):
+        """Replace parser + scoring with pure-async stand-ins."""
+
+        async def fake_parse(resume_text):
+            return parsed
+
+        agent.parser.parse_text_async = fake_parse
+        agent.screen_parsed_async = screen_impl
+
+    def test_fans_out_and_returns_results_in_order(self, agent, sample_jd, sample_output, parsed):
+        """Empty-text resumes fail in isolation; others return outputs."""
+        async def fake_screen(parsed, resume_text, jd_data, resume_filename=None):
+            return sample_output
+
+        self._stub_parse_and_screen(agent, parsed, fake_screen)
+
+        resumes = [
+            {"name": "a.txt", "text": "resume a"},
+            {"name": "b.txt", "text": "resume b"},
+            {"name": "c.txt", "text": ""},  # empty -> isolated failure
+        ]
+        results = asyncio.run(agent.screen_batch_async(resumes, sample_jd))
+
+        assert isinstance(results[0], ResumeScreeningOutput)
+        assert isinstance(results[1], ResumeScreeningOutput)
+        assert isinstance(results[2], Exception)
+        assert "no extractable text" in str(results[2]).lower()
+
+    def test_failure_does_not_cancel_in_flight_tasks(
+        self, agent, sample_jd, sample_output, parsed
+    ):
+        """A failing resume must not cancel the other in-flight screenings."""
+        async def fake_screen(parsed, resume_text, jd_data, resume_filename=None):
+            if resume_filename == "boom.txt":
+                raise RuntimeError("Transient 503 from provider")
+            return sample_output
+
+        self._stub_parse_and_screen(agent, parsed, fake_screen)
+
+        resumes = [
+            {"name": "boom.txt", "text": "will fail"},
+            {"name": "ok.txt", "text": "fine"},
+            {"name": "ok2.txt", "text": "fine too"},
+        ]
+        results = asyncio.run(agent.screen_batch_async(resumes, sample_jd))
+
+        assert isinstance(results[0], Exception)
+        assert isinstance(results[1], ResumeScreeningOutput)
+        assert isinstance(results[2], ResumeScreeningOutput)
+
+    def test_reports_progress_per_resume(self, agent, sample_jd, sample_output, parsed):
+        """on_progress fires as each resume finishes with its result/error."""
+        async def fake_screen(parsed, resume_text, jd_data, resume_filename=None):
+            if resume_filename == "bad.txt":
+                raise ValueError("bad parse")
+            return sample_output
+
+        self._stub_parse_and_screen(agent, parsed, fake_screen)
+
+        progress = []
+        resumes = [
+            {"name": "a.txt", "text": "resume a"},
+            {"name": "bad.txt", "text": "bad"},
+            {"name": "c.txt", "text": "resume c"},
+        ]
+        asyncio.run(
+            agent.screen_batch_async(
+                resumes,
+                sample_jd,
+                on_progress=lambda done, total, name, result, error: progress.append(
+                    (done, total, name, result, error)
+                ),
+            )
+        )
+
+        assert len(progress) == 3
+        assert progress[-1][:2] == (3, 3)
+        by_name = {
+            name: (result, error)
+            for done, total, name, result, error in progress
+        }
+        assert isinstance(by_name["a.txt"][0], ResumeScreeningOutput)
+        assert by_name["a.txt"][1] is None
+        assert by_name["bad.txt"][0] is None
+        assert isinstance(by_name["bad.txt"][1], ValueError)
+
+    def test_caps_concurrency_with_semaphore(self, agent, sample_jd, sample_output, parsed):
+        """Concurrent screening is capped by SCREENING_CONCURRENCY."""
+        active = 0
+        max_active = 0
+
+        async def fake_screen(parsed, resume_text, jd_data, resume_filename=None):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return sample_output
+
+        self._stub_parse_and_screen(agent, parsed, fake_screen)
+
+        resumes = [
+            {"name": f"r{i}.txt", "text": f"resume {i}"}
+            for i in range(10)
+        ]
+        os.environ["SCREENING_CONCURRENCY"] = "3"
+        try:
+            asyncio.run(agent.screen_batch_async(resumes, sample_jd))
+        finally:
+            os.environ.pop("SCREENING_CONCURRENCY", None)
+
+        assert 1 <= max_active <= 3
+
+    def test_awaits_shared_jd_analysis_task(
+        self, agent, sample_jd, sample_output, parsed
+    ):
+        """Resumes are scored against the JD from the shared analysis task."""
+        seen_jd = []
+
+        async def fake_screen(parsed, resume_text, jd_data, resume_filename=None):
+            seen_jd.append(jd_data)
+            return sample_output
+
+        self._stub_parse_and_screen(agent, parsed, fake_screen)
+
+        async def analyze_jd():
+            await asyncio.sleep(0.01)
+            return {**sample_jd, "required_skills": ["Python", "Docker"]}
+
+        async def run():
+            jd_task = asyncio.create_task(analyze_jd())
+            return await agent.screen_batch_async(
+                [{"name": "a.txt", "text": "resume a"}],
+                sample_jd,
+                jd_analysis_task=jd_task,
+            )
+
+        results = asyncio.run(run())
+
+        assert isinstance(results[0], ResumeScreeningOutput)
+        assert seen_jd and seen_jd[0]["required_skills"] == ["Python", "Docker"]
+
+    def test_jd_task_failure_does_not_fail_batch(
+        self, agent, sample_jd, sample_output, parsed
+    ):
+        """A failing JD analysis task falls back to the raw JD, batch survives."""
+        seen_jd = []
+
+        async def fake_screen(parsed, resume_text, jd_data, resume_filename=None):
+            seen_jd.append(jd_data)
+            return sample_output
+
+        self._stub_parse_and_screen(agent, parsed, fake_screen)
+
+        async def analyze_jd():
+            await asyncio.sleep(0.01)
+            raise RuntimeError("JD LLM unavailable")
+
+        async def run():
+            jd_task = asyncio.create_task(analyze_jd())
+            return await agent.screen_batch_async(
+                [{"name": "a.txt", "text": "resume a"}],
+                sample_jd,
+                jd_analysis_task=jd_task,
+            )
+
+        results = asyncio.run(run())
+
+        assert isinstance(results[0], ResumeScreeningOutput)
+        assert seen_jd and seen_jd[0]["required_skills"] == sample_jd["required_skills"]

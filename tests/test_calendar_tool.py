@@ -220,3 +220,40 @@ class TestClearAll:
         assert len(calendar._load_slots()) == 1
         calendar.clear_all()
         assert len(calendar._load_slots()) == 0
+
+
+class TestPurgePastBookings:
+    """Tests for purge_past_bookings method."""
+
+    def test_purge_removes_past_dates(self, calendar, tmp_path):
+        """Bookings before the reference date are removed."""
+        calendar.book_slot(
+            InterviewSlot(
+                candidate_name="Old Candidate", date="2020-01-01",
+                time_start="10:00", time_end="11:00",
+                interviewer="Alice", interview_type="technical", status="proposed",
+            )
+        )
+        calendar.book_slot(
+            InterviewSlot(
+                candidate_name="Future Candidate", date="2099-01-01",
+                time_start="10:00", time_end="11:00",
+                interviewer="Alice", interview_type="technical", status="proposed",
+            )
+        )
+        removed = calendar.purge_past_bookings(today="2026-08-05")
+        assert removed == 1
+        bookings = calendar._load_slots()
+        assert len(bookings) == 1
+        assert bookings[0]["candidate_name"] == "Future Candidate"
+
+    def test_purge_no_op_when_nothing_past(self, calendar):
+        """purge_past_bookings returns 0 when every booking is current/future."""
+        calendar.book_slot(
+            InterviewSlot(
+                candidate_name="Current", date="2099-01-01",
+                time_start="10:00", time_end="11:00",
+                interviewer="Alice", interview_type="technical", status="proposed",
+            )
+        )
+        assert calendar.purge_past_bookings(today="2026-08-05") == 0

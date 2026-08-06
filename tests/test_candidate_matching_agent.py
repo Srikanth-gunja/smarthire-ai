@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -106,6 +107,46 @@ class TestRankCandidates:
         result = agent.rank_candidates(input_data)
         assert result.total_candidates_evaluated == 0
         assert result.ranked_candidates == []
+
+    def test_rank_candidates_async_returns_output(
+        self, agent, mock_llm, sample_resumes, sample_jd
+    ):
+        """rank_candidates_async returns the same output via non-blocking calls."""
+        mock_result = LLMMatchResult(
+            ranked_candidates=[
+                LLMRankedCandidate(
+                    candidate_name="Alice", match_score=85.0,
+                    skills_match=["Python", "React", "Docker"], skills_gap=[],
+                    experience_match=True, justification="Strong match.",
+                ),
+                LLMRankedCandidate(
+                    candidate_name="Bob", match_score=60.0,
+                    skills_match=[], skills_gap=["Python", "React", "Docker"],
+                    experience_match=False, justification="Missing skills.",
+                ),
+            ],
+            summary="Alice is the stronger candidate.",
+        )
+        mock_structured = MagicMock()
+        mock_structured.ainvoke = AsyncMock(return_value=mock_result)
+        mock_structured.return_value = mock_result
+        mock_llm.with_structured_output.return_value = mock_structured
+
+        with patch("agents.candidate_matching_agent.ChatPromptTemplate") as mock_prompt_cls:
+            mock_prompt = MagicMock()
+            mock_chain = MagicMock()
+            mock_chain.ainvoke = AsyncMock(return_value=mock_result)
+            mock_prompt.__or__ = MagicMock(return_value=mock_chain)
+            mock_prompt_cls.from_messages.return_value = mock_prompt
+
+            input_data = CandidateMatchingInput(resumes=sample_resumes, job_description=sample_jd)
+            result = asyncio.run(agent.rank_candidates_async(input_data))
+
+        assert isinstance(result, CandidateMatchingOutput)
+        assert len(result.ranked_candidates) == 2
+        assert result.ranked_candidates[0].rank == 1
+        assert result.ranked_candidates[1].rank == 2
+        assert result.total_candidates_evaluated == 2
 
 
 class TestComputeSkillsMatch:

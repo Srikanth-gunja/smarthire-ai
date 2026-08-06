@@ -55,6 +55,10 @@ class SmartHireState(TypedDict, total=False):
     # like skills, experience, education, summary.
     resumes: list[dict]
 
+    # Per-resume failures from a parallel screening batch. Failed documents
+    # remain visible in the UI and are excluded from candidate matching.
+    screening_failures: list[dict]
+
     # Raw resume documents supplied for the current workflow.  Keeping each
     # document separate is essential: a batch upload must be parsed as N
     # candidates, never as one concatenated "resume".
