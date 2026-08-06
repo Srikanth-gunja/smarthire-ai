@@ -4,6 +4,8 @@
 
 SmartHire AI orchestrates a team of specialized AI agents to automate the end-to-end hiring workflow — from resume screening and candidate ranking to interview scheduling and HR Q&A. All conversation state and recruitment data persist to SQLite, so nothing is lost between sessions or app restarts.
 
+**Live demo:** <https://smart-hire-ai-456548934993.asia-south1.run.app/>
+
 ---
 
 ## Table of Contents
