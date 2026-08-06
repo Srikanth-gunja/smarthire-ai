@@ -7,14 +7,5 @@
     "interviewer": "Bob Tech Lead",
     "interview_type": "technical",
     "status": "confirmed"
-  },
-  {
-    "candidate_name": "Gunja Srikanth",
-    "date": "2026-08-05",
-    "time_start": "13:00",
-    "time_end": "14:00",
-    "interviewer": "Bob Tech Lead",
-    "interview_type": "technical",
-    "status": "confirmed"
   }
 ]
